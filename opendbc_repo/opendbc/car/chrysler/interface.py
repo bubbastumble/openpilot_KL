@@ -32,6 +32,7 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= ChryslerSafetyFlags.RAM_HD.value
     elif candidate in RAM_DT:
       ret.safetyConfigs[0].safetyParam |= ChryslerSafetyFlags.RAM_DT.value
+
     elif candidate in CUSW_CARS:
       ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.chryslerCusw)]
 
