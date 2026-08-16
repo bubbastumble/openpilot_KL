@@ -16,6 +16,7 @@
 #include "opendbc/safety/modes/ford.h"
 #include "opendbc/safety/modes/hyundai.h"
 #include "opendbc/safety/modes/chrysler.h"
+#include "opendbc/safety/modes/chrysler_cusw.h"
 #include "opendbc/safety/modes/rivian.h"
 #include "opendbc/safety/modes/subaru.h"
 #include "opendbc/safety/modes/subaru_preglobal.h"
@@ -421,6 +422,7 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
     {SAFETY_BODY, &body_hooks},
     {SAFETY_FORD, &ford_hooks},
     {SAFETY_RIVIAN, &rivian_hooks},
+    {SAFETY_CHRYSLER_CUSW, &chrysler_cusw_hooks},
     {SAFETY_TESLA, &tesla_hooks},
     {SAFETY_TESLA_PREAP, &tesla_preap_hooks},
 #ifdef CANFD

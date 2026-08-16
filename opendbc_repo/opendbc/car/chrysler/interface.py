@@ -3,7 +3,7 @@ from opendbc.car import get_safety_config, structs
 from opendbc.car.chrysler.carcontroller import CarController
 from opendbc.car.chrysler.carstate import CarState
 from opendbc.car.chrysler.radar_interface import RadarInterface
-from opendbc.car.chrysler.values import CAR, JEEPS, RAM_HD, RAM_DT, RAM_CARS, ChryslerFlags, ChryslerSafetyFlags
+from opendbc.car.chrysler.values import CAR, CUSW_CARS, JEEPS, RAM_HD, RAM_DT, RAM_CARS, ChryslerFlags, ChryslerSafetyFlags
 from opendbc.car.interfaces import CarInterfaceBase
 
 
@@ -30,6 +30,8 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= ChryslerSafetyFlags.RAM_DT.value
     elif candidate in JEEPS:
       ret.safetyConfigs[0].safetyParam |= ChryslerSafetyFlags.JEEP_BRAKE_HOLD.value
+    elif candidate in CUSW_CARS:
+      ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.chryslerCusw)]
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
     if candidate not in RAM_CARS:
@@ -48,6 +50,9 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.pid.kf = 0.00006
 
     # Jeep
+    elif candidate == CAR.JEEP_CHEROKEE_5TH_GEN:
+      ret.steerActuatorDelay = 0.15
+
     elif candidate in (CAR.JEEP_GRAND_CHEROKEE, CAR.JEEP_GRAND_CHEROKEE_2019):
       ret.steerActuatorDelay = 0.2
 
@@ -86,6 +91,6 @@ class CarInterface(CarInterfaceBase):
       ret.minSteerSpeed = 17.5  # m/s 17 on the way up, 13 on the way down once engaged.
 
     ret.centerToFront = ret.wheelbase * 0.44
-    ret.enableBsm = 720 in fingerprint[0]
+    ret.enableBsm = (0x62cc033 if candidate in CUSW_CARS else 0x2d0) in fingerprint[0]
 
     return ret
