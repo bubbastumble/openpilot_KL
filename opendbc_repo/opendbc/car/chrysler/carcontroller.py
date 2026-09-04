@@ -26,6 +26,8 @@ class CarController(CarControllerBase):
     self.last_das_3_counter = -1
     self.jeep_hold_cancelled = False
     self.jeep_cruise_was_active = False
+    self.button_frame = 0
+    self.last_button_counter = -1
 
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.params = CarControllerParams(CP)
@@ -56,6 +58,19 @@ class CarController(CarControllerBase):
             (not aol_qualified(self.CP, marked_only=True) or CS.out.cruiseState.enabled)):
         self.last_button_frame = self.frame
         can_sends.append(chryslercan.create_cruise_buttons(self.packer, CS.button_counter + 1, das_bus, resume=True))
+
+      # AI intelligent cruise button control (Redneck Cruise)
+      elif getattr(CS, "redneck_send_button", 0) in (1, 2) and CC.enabled and CS.out.cruiseState.enabled and not CS.out.gasPressed:
+        accel = getattr(CS, "redneck_send_button", 0) == 1
+        decel = getattr(CS, "redneck_send_button", 0) == 2
+        if CS.button_counter != self.last_button_counter:
+          self.last_button_counter = CS.button_counter
+          self.button_frame += 1
+          button_counter_offset = [1, 1, 0, None][self.button_frame % 4]
+          if button_counter_offset is not None:
+            self.last_button_frame = self.frame
+            can_sends.append(chryslercan.create_cruise_buttons(self.packer, CS.button_counter + button_counter_offset, das_bus,
+                                                               accel=accel, decel=decel))
 
     # HUD alerts
     if self.frame % 25 == 0:
