@@ -13,7 +13,7 @@ from cereal import custom
 from opendbc.car import DT_CTRL, apply_hysteresis, create_button_events, gen_empty_fingerprint, scale_rot_inertia, scale_tire_stiffness, STD_CARGO_KG
 from opendbc.car import structs
 from opendbc.car.can_definitions import CanData, CanRecvCallable, CanSendCallable
-from opendbc.car.chrysler.values import CAR as CHRYSLER, ChryslerStarPilotFlags
+from opendbc.car.chrysler.values import CAR as CHRYSLER, ChryslerStarPilotFlags, CUSW_CARS
 from opendbc.car.common.basedir import BASEDIR
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.common.simple_kalman import KF1D, get_kalman_gain
@@ -222,6 +222,12 @@ class CarInterfaceBase(ABC):
         if 0x4FF in fingerprint[0]:
           fp_ret.flags |= ChryslerStarPilotFlags.NO_MIN_STEERING_SPEED.value
           CP.minSteerSpeed = 0.
+
+        if candidate in CUSW_CARS:
+          fp_ret.redneckCruiseAvailable = True
+          if params.get_bool("RedneckCruise"):
+            fp_ret.pcmCruiseSpeed = False
+            CP.openpilotLongitudinalControl = True
 
       elif platform in GM:
         fp_ret.canUsePedal = True
