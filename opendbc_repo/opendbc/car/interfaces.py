@@ -227,7 +227,6 @@ class CarInterfaceBase(ABC):
           fp_ret.redneckCruiseAvailable = True
           if params.get_bool("RedneckCruise"):
             fp_ret.pcmCruiseSpeed = False
-            CP.openpilotLongitudinalControl = True
 
       elif platform in GM:
         fp_ret.canUsePedal = True
