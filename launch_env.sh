@@ -29,6 +29,10 @@ if [ -z "$AGNOS_VERSION" ]; then
   export AGNOS_VERSION="20.5.2"
 fi
 
+if [ -z "$AGNOS_ACCEPTED_VERSIONS" ]; then
+  export AGNOS_ACCEPTED_VERSIONS="12.8.28 19.6.19 20.5.2"
+fi
+
 export AGNOS_UPDATE_POLICY="auto"
 # C3 selects its complete matching firmware chain in the AGNOS manifest loader.
 # Unknown hardware retains its installed OS.
@@ -40,4 +44,3 @@ if [ -f /AGNOS ] || [ -e /sys/firmware/devicetree/base/model ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
-
