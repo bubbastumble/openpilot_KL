@@ -13,6 +13,7 @@ dependencies = [
   "sounddevice",  # micd + soundd
   "pyserial",     # pigeond + qcomgpsd
   "requests",     # many one-off uses
+  "pywebpush",    # Galaxy Sentry browser push notifications
   "sympy",        # rednose + friends
   "crcmod",       # cars + qcomgpsd
   "tqdm",         # cars (fw_versions.py) on start + many one-off uses
@@ -27,6 +28,11 @@ dependencies = [
   "Cython",
   "setuptools",
   "numpy >=2.0",
+
+  # AGNOS 19.6 native build dependencies
+  "comma-deps-capnproto; python_version >= '3.12'",
+  "comma-deps-ffmpeg; python_version >= '3.12'",
+  "libdatachannel-py>=2026.1.0.dev2; python_version >= '3.12'",
 
   # body / webrtcd
   "aiohttp",

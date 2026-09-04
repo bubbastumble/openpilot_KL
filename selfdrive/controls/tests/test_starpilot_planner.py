@@ -2,8 +2,10 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
-from openpilot.starpilot.controls.starpilot_planner import StarPilotPlanner
+from openpilot.starpilot.controls.starpilot_planner import StarPilotPlanner, get_force_stop_jerk_scale
+from openpilot.selfdrive.controls.lib.longitudinal_vehicle_tunes import get_lead_follow_jerk_scale
 import openpilot.starpilot.controls.starpilot_planner as starpilot_planner_module
 
 
@@ -33,7 +35,20 @@ def make_toggles(**overrides):
   return SimpleNamespace(**defaults)
 
 
-def make_sm(planner, *, frame: int, v_ego: float, left_blinker: bool, right_blinker: bool = False):
+def test_force_stop_jerk_scale_is_platform_specific():
+  assert get_force_stop_jerk_scale(SimpleNamespace(carFingerprint="HYUNDAI_ELANTRA_2021")) == 0.80
+  assert get_force_stop_jerk_scale(SimpleNamespace(carFingerprint="OTHER_CAR")) == 0.32
+
+
+def test_lead_follow_jerk_scale_is_platform_specific():
+  assert get_lead_follow_jerk_scale(SimpleNamespace(brand="hyundai", carFingerprint="HYUNDAI_ELANTRA_2021")) == 1.25
+  assert get_lead_follow_jerk_scale(SimpleNamespace(brand="hyundai", carFingerprint="GENESIS_GV70_ELECTRIFIED_1ST_GEN")) == 1.75
+  assert get_lead_follow_jerk_scale(SimpleNamespace(brand="ford", carFingerprint="FORD_F_150_LIGHTNING_MK1")) == 1.35
+  assert get_lead_follow_jerk_scale(SimpleNamespace(brand="honda", carFingerprint="HONDA_CRV_5G")) == 1.35
+  assert get_lead_follow_jerk_scale(SimpleNamespace(brand="other", carFingerprint="OTHER_CAR")) == 1.0
+
+
+def make_sm(planner, *, frame: int, v_ego: float, left_blinker: bool, right_blinker: bool = False, standstill: bool = False):
   return FakeSM(frame, {
     "radarState": SimpleNamespace(
       leadOne=SimpleNamespace(status=False, dRel=float("inf"), vLead=0.0, modelProb=0.0, radar=False),
@@ -42,7 +57,7 @@ def make_sm(planner, *, frame: int, v_ego: float, left_blinker: bool, right_blin
     "carState": SimpleNamespace(
       vCruise=50.0,
       vEgo=v_ego,
-      standstill=False,
+      standstill=standstill,
       leftBlinker=left_blinker,
       rightBlinker=right_blinker,
     ),
@@ -78,6 +93,65 @@ def test_lateral_resume_delay_zero_keeps_immediate_resume(monkeypatch):
     planner.update(0.0, False, make_sm(planner, frame=2, v_ego=4.0, left_blinker=False), toggles)
     assert planner.lateral_check is True
     assert planner.blinker_delay_active is False
+  finally:
+    planner.shutdown()
+
+
+def test_turn_signal_keeps_lateral_paused_at_standstill(monkeypatch):
+  planner = make_planner(monkeypatch)
+
+  try:
+    toggles = make_toggles(pause_lateral_below_speed=99.0)
+
+    planner.update(0.0, False, make_sm(planner, frame=1, v_ego=0.0, left_blinker=True, standstill=True), toggles)
+
+    assert planner.lateral_check is False
+  finally:
+    planner.shutdown()
+
+
+def test_standstill_without_turn_signal_keeps_lateral_allowed(monkeypatch):
+  planner = make_planner(monkeypatch)
+
+  try:
+    toggles = make_toggles(pause_lateral_below_speed=99.0)
+
+    planner.update(0.0, False, make_sm(planner, frame=1, v_ego=0.0, left_blinker=False, standstill=True), toggles)
+
+    assert planner.lateral_check is True
+  finally:
+    planner.shutdown()
+
+
+def test_manual_lateral_pause_blocks_lateral_while_cruise_is_enabled(monkeypatch):
+  planner = make_planner(monkeypatch)
+
+  try:
+    sm = make_sm(planner, frame=1, v_ego=20.0, left_blinker=False)
+    sm["starpilotCarState"].pauseLateral = True
+
+    planner.update(0.0, False, sm, make_toggles())
+
+    assert planner.lateral_check is False
+  finally:
+    planner.shutdown()
+
+
+def test_pulse_glide_target_is_published_after_vcruise_update(monkeypatch):
+  planner = make_planner(monkeypatch)
+
+  try:
+    normal_target = 65.0 * CV.MPH_TO_MS
+    glide_target = 60.0 * CV.MPH_TO_MS
+    monkeypatch.setattr(planner.starpilot_vcruise, "update", lambda *args, **kwargs: normal_target)
+
+    def publish_glide_target(*args, **kwargs):
+      planner.starpilot_acceleration.pulse_glide_target = glide_target
+
+    monkeypatch.setattr(planner.starpilot_acceleration, "update", publish_glide_target)
+    planner.update(0.0, False, make_sm(planner, frame=1, v_ego=normal_target, left_blinker=False), make_toggles())
+
+    assert planner.v_cruise == glide_target
   finally:
     planner.shutdown()
 

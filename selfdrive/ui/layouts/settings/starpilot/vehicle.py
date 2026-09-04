@@ -29,6 +29,8 @@ from openpilot.selfdrive.ui.layouts.settings.starpilot.aethergrid import (
   GROUP_HEADER_GAP,
   GROUP_HEADER_HEIGHT,
   GROUP_HEADER_LINE_GAP,
+  GROUP_HEADER_TOTAL_HEIGHT,
+  GROUP_TOP_INSET,
   draw_group_header,
   draw_list_group_shell,
   draw_rounded_fill,
@@ -52,6 +54,7 @@ ACTION_OPTIONS = [
   {"id": 0, "name": tr_noop("No Action")},
   {"id": 1, "name": tr_noop("Change Personality"), "requires_longitudinal": True},
   {"id": 2, "name": tr_noop("Force Coast"), "requires_longitudinal": True},
+  {"id": 14, "name": tr_noop("Pulse and Glide"), "requires_longitudinal": True, "requires_developer": True},
   {"id": 3, "name": tr_noop("Pause Steering")},
   {"id": 4, "name": tr_noop("Pause Accel/Brake"), "requires_longitudinal": True},
   {"id": 5, "name": tr_noop("Toggle Experimental"), "requires_longitudinal": True},
@@ -191,17 +194,17 @@ class VehicleSettingsManagerView(PanelManagerView):
 
     row_h = rect.height
     if row_h < 90:
-      title_size = 36
-      subtitle_size = 26
-      value_size = 32
+      title_size = 30
+      subtitle_size = 24
+      value_size = 26
     elif row_h < 105:
-      title_size = 42
-      subtitle_size = 32
-      value_size = 38
+      title_size = 34
+      subtitle_size = 26
+      value_size = 28
     else:
-      title_size = 49
-      subtitle_size = 38
-      value_size = 44
+      title_size = 36
+      subtitle_size = 28
+      value_size = 30
 
     if row.type == "value" or row.id.startswith("combo:"):
       value_text = row.get_value() if row.get_value else ""
@@ -221,10 +224,9 @@ class VehicleSettingsManagerView(PanelManagerView):
                              style=PANEL_STYLE)
 
   def _draw_section(self, y: float, x: float, width: float, title: str, rows: list[SettingRow], row_height: float = ROW_HEIGHT) -> float:
-    hdr_oh = GROUP_HEADER_HEIGHT + GROUP_HEADER_LINE_GAP + GROUP_HEADER_GAP
-    group_h = len(rows) * row_height + hdr_oh + 4
+    group_h = len(rows) * row_height + GROUP_HEADER_TOTAL_HEIGHT + GROUP_TOP_INSET
     draw_list_group_shell(rl.Rectangle(x, y, width, group_h), style=PANEL_STYLE)
-    current_y = y + 4
+    current_y = y + GROUP_TOP_INSET
     current_y = draw_group_header(x + 24, current_y, width - 48, tr(title))
     for i, row in enumerate(rows):
       self._draw_row(rl.Rectangle(x, current_y, width, row_height), row, i == len(rows) - 1)
@@ -241,7 +243,7 @@ class VehicleSettingsManagerView(PanelManagerView):
       rx = rect.x + col_w + self.COLUMN_GAP
 
       draw_list_group_shell(rl.Rectangle(rect.x, y, col_w, self._container_h), style=PANEL_STYLE)
-      row_y = y + 4
+      row_y = y + GROUP_TOP_INSET
       row_y = draw_group_header(rect.x + 24, row_y, col_w - 48, tr("Vehicle Identity"))
       for i, row in enumerate(identity_rows):
         self._draw_row(rl.Rectangle(rect.x, row_y, col_w, self._left_row_height),
@@ -249,6 +251,7 @@ class VehicleSettingsManagerView(PanelManagerView):
         row_y += self._left_row_height
 
       if steering_rows:
+        row_y += GROUP_TOP_INSET
         row_y = draw_group_header(rect.x + 24, row_y, col_w - 48, tr("Steering Controls"))
         for i, row in enumerate(steering_rows):
           self._draw_row(rl.Rectangle(rect.x, row_y, col_w, self._left_row_height),
@@ -257,7 +260,7 @@ class VehicleSettingsManagerView(PanelManagerView):
 
       if self._toggle_grid.tiles:
         draw_list_group_shell(rl.Rectangle(rx, y, col_w, self._container_h), style=PANEL_STYLE)
-        tile_y = y + 4
+        tile_y = y + GROUP_TOP_INSET
         tile_y = draw_group_header(rx + 24, tile_y, col_w - 48, tr("Features"))
         avail_h = self._container_h - (tile_y - y)
         self._render_page_grid(self._toggle_grid, rl.Rectangle(rx + 12, tile_y, col_w - 24, max(0.0, avail_h - 12)))
@@ -272,10 +275,9 @@ class VehicleSettingsManagerView(PanelManagerView):
           self._toggle_grid._columns = 3
         avail = width - 24
         th = self.measure_page_grid_height(self._toggle_grid, avail)
-        hdr_oh = GROUP_HEADER_HEIGHT + GROUP_HEADER_LINE_GAP + GROUP_HEADER_GAP
-        group_h = th + 24 + 4 + hdr_oh
+        group_h = th + 24 + GROUP_TOP_INSET + GROUP_HEADER_TOTAL_HEIGHT
         draw_list_group_shell(rl.Rectangle(rect.x, y, width, group_h), style=PANEL_STYLE)
-        features_y = y + 4
+        features_y = y + GROUP_TOP_INSET
         features_y = draw_group_header(rect.x + 24, features_y, width - 48, tr("Features"))
         self._render_page_grid(self._toggle_grid, rl.Rectangle(rect.x + 12, features_y, avail, max(0.0, group_h - (features_y - y) - 12)))
 
@@ -296,10 +298,9 @@ class VehicleSettingsManagerView(PanelManagerView):
         tiles_h = self.measure_page_grid_height(self._toggle_grid, width - 24)
 
     if self._uses_two_columns(width):
-      hdr_oh = GROUP_HEADER_HEIGHT + GROUP_HEADER_LINE_GAP + GROUP_HEADER_GAP
-      subsection_overhead = hdr_oh + 4
+      subsection_overhead = GROUP_HEADER_TOTAL_HEIGHT + GROUP_TOP_INSET
       if steering_rows:
-        subsection_overhead += hdr_oh
+        subsection_overhead += GROUP_HEADER_TOTAL_HEIGHT + GROUP_TOP_INSET
 
       avail_h = self._scroll_rect.height if self._scroll_rect else 760.0
       avail_for_rows = max(100.0, avail_h - subsection_overhead)
@@ -315,11 +316,10 @@ class VehicleSettingsManagerView(PanelManagerView):
       self._container_h = total_h
       return total_h
 
-    hdr_oh = GROUP_HEADER_HEIGHT + GROUP_HEADER_LINE_GAP + GROUP_HEADER_GAP
-    identity_natural_h = hdr_oh + 4 + len(identity_rows) * ROW_HEIGHT
-    steering_natural_h = hdr_oh + 4 + len(steering_rows) * ROW_HEIGHT
+    identity_natural_h = GROUP_HEADER_TOTAL_HEIGHT + GROUP_TOP_INSET + len(identity_rows) * ROW_HEIGHT
+    steering_natural_h = GROUP_HEADER_TOTAL_HEIGHT + GROUP_TOP_INSET + len(steering_rows) * ROW_HEIGHT
     left_natural_h = identity_natural_h + SECTION_GAP + steering_natural_h
-    tiles_overhead = 4 + hdr_oh + 24 if tiles_h else 0
+    tiles_overhead = GROUP_TOP_INSET + GROUP_HEADER_TOTAL_HEIGHT + 24 if tiles_h else 0
     return left_natural_h + tiles_h + tiles_overhead
 
   def _build_driving_toggles(self) -> list[dict]:
@@ -811,11 +811,14 @@ class StarPilotVehicleSettingsLayout(_SettingsPage):
       allowed_ids = {0, 9, 10, 11, 12, 13}
       options = [o for o in ACTION_OPTIONS if o["id"] in allowed_ids]
     else:
-      allowed_ids = set(range(9)) | {11, 12, 13}
+      allowed_ids = set(range(9)) | {11, 12, 13, 14}
       if key == "LKASButtonControl":
         allowed_ids.add(9)
+      developer_access = self._params.get_bool("DeveloperUI") or self._params.get_bool("GalaxyDeveloperMode")
       options = [o for o in ACTION_OPTIONS
-                 if o["id"] in allowed_ids and (cs.hasOpenpilotLongitudinal or not o.get("requires_longitudinal", False))]
+                 if o["id"] in allowed_ids and
+                 (cs.hasOpenpilotLongitudinal or not o.get("requires_longitudinal", False)) and
+                 (developer_access or not o.get("requires_developer", False))]
 
     option_labels = [tr(o["name"]) for o in options]
     option_ids = [o["id"] for o in options]

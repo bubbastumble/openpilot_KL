@@ -4,7 +4,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.subaru.values import DBC, CanBus, SubaruFlags
+from opendbc.car.subaru.values import DBC, CanBus, SUBARU_AVH_CARS, SUBARU_STOP_START_CARS, SubaruFlags
 from opendbc.car import CanSignalRateCalculator
 
 
@@ -15,12 +15,30 @@ class CarState(CarStateBase):
     self.shifter_values = can_define.dv["Transmission"]["Gear"]
 
     self.angle_rate_calulator = CanSignalRateCalculator(50)
+    self.dashlights_msg = {}
+    self.dashlights_dat = b""
+    self.stop_start_state = 0
+    self.avh_msg = {}
+    self.avh_dat = b""
 
   def update(self, can_parsers, starpilot_toggles) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
     cp_alt = can_parsers[Bus.alt]
+    cp_main = can_parsers[Bus.main] if self.CP.flags & SubaruFlags.D_PLATFORM else cp
+    cp_angle = cp_main if self.CP.flags & SubaruFlags.D_PLATFORM else cp
     ret = structs.CarState()
+
+    if self.CP.carFingerprint in SUBARU_STOP_START_CARS:
+      stop_start_cp = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp
+      self.dashlights_msg = copy.copy(stop_start_cp.vl["Dashlights"])
+      self.dashlights_dat = stop_start_cp.vl_raw["Dashlights"]
+      self.stop_start_state = stop_start_cp.vl["Engine_Stop_Start"]["STOP_START_STATE"]
+
+    if self.CP.carFingerprint in SUBARU_AVH_CARS:
+      avh_cp = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp
+      self.avh_msg = copy.copy(avh_cp.vl["AVH"])
+      self.avh_dat = avh_cp.vl_raw["AVH"]
 
     throttle_msg = cp.vl["Throttle"] if not (self.CP.flags & SubaruFlags.HYBRID) else cp_alt.vl["Throttle_Hybrid"]
     ret.gasPressed = throttle_msg["Throttle_Pedal"] > 1e-5
@@ -54,27 +72,37 @@ class CarState(CarStateBase):
                                                                       cp.vl["Dashlights"]["RIGHT_BLINKER"])
 
     if self.CP.enableBsm:
-      ret.leftBlindspot = (cp.vl["BSD_RCTA"]["L_ADJACENT"] == 1) or (cp.vl["BSD_RCTA"]["L_APPROACHING"] == 1)
-      ret.rightBlindspot = (cp.vl["BSD_RCTA"]["R_ADJACENT"] == 1) or (cp.vl["BSD_RCTA"]["R_APPROACHING"] == 1)
+      cp_bsm = cp_main if self.CP.flags & SubaruFlags.D_PLATFORM else cp
+      ret.leftBlindspot = (cp_bsm.vl["BSD_RCTA"]["L_ADJACENT"] == 1) or (cp_bsm.vl["BSD_RCTA"]["L_APPROACHING"] == 1)
+      ret.rightBlindspot = (cp_bsm.vl["BSD_RCTA"]["R_ADJACENT"] == 1) or (cp_bsm.vl["BSD_RCTA"]["R_APPROACHING"] == 1)
 
     cp_transmission = cp_alt if self.CP.flags & SubaruFlags.HYBRID else cp
     can_gear = int(cp_transmission.vl["Transmission"]["Gear"])
     ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(can_gear, None))
 
-    ret.steeringAngleDeg = cp.vl["Steering_Torque"]["Steering_Angle"]
+    if self.CP.flags & SubaruFlags.LKAS_ANGLE:
+      ret.steeringAngleDeg = cp_angle.vl["Steering_2"]["Steering_Angle"]
+      steering_updated = len(cp_angle.vl_all["Steering_2"]["Steering_Angle"]) > 0
+    else:
+      ret.steeringAngleDeg = cp.vl["Steering_Torque"]["Steering_Angle"]
+      steering_updated = len(cp.vl_all["Steering_Torque"]["Steering_Angle"]) > 0
 
     if not (self.CP.flags & SubaruFlags.PREGLOBAL):
       # ideally we get this from the car, but unclear if it exists. diagnostic software doesn't even have it
-      ret.steeringRateDeg = self.angle_rate_calulator.update(ret.steeringAngleDeg, cp.vl["Steering_Torque"]["COUNTER"])
+      ret.steeringRateDeg = self.angle_rate_calulator.update(ret.steeringAngleDeg, steering_updated)
 
-    ret.steeringTorque = cp.vl["Steering_Torque"]["Steer_Torque_Sensor"]
-    ret.steeringTorqueEps = cp.vl["Steering_Torque"]["Steer_Torque_Output"]
+    ret.steeringTorque = cp_angle.vl["Steering_Torque"]["Steer_Torque_Sensor"]
+    ret.steeringTorqueEps = cp_angle.vl["Steering_Torque"]["Steer_Torque_Output"]
 
     steer_threshold = 75 if self.CP.flags & SubaruFlags.PREGLOBAL else 80
     ret.steeringPressed = abs(ret.steeringTorque) > steer_threshold
 
     cp_cruise = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp
-    if self.CP.flags & SubaruFlags.HYBRID:
+    cp_es_brake = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp_cam
+    if self.CP.flags & SubaruFlags.LKAS_ANGLE:
+      ret.cruiseState.enabled = cp_es_brake.vl["ES_Status"]['Cruise_Activated'] != 0
+      ret.cruiseState.available = cp_cam.vl["ES_DashStatus"]['Cruise_On'] != 0
+    elif self.CP.flags & SubaruFlags.HYBRID:
       ret.cruiseState.enabled = cp_cam.vl["ES_DashStatus"]['Cruise_Activated'] != 0
       ret.cruiseState.available = cp_cam.vl["ES_DashStatus"]['Cruise_On'] != 0
     else:
@@ -91,22 +119,20 @@ class CarState(CarStateBase):
                         cp.vl["BodyInfo"]["DOOR_OPEN_RL"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FR"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FL"]])
-    ret.steerFaultPermanent = cp.vl["Steering_Torque"]["Steer_Error_1"] == 1
+    ret.steerFaultPermanent = cp_angle.vl["Steering_Torque"]["Steer_Error_1"] == 1
 
     if self.CP.flags & SubaruFlags.PREGLOBAL:
       self.cruise_button = cp_cam.vl["ES_Distance"]["Cruise_Button"]
       self.ready = not cp_cam.vl["ES_DashStatus"]["Not_Ready_Startup"]
     else:
-      ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
+      ret.steerFaultTemporary = cp_angle.vl["Steering_Torque"]["Steer_Warning"] == 1
       ret.cruiseState.nonAdaptive = cp_cam.vl["ES_DashStatus"]["Conventional_Cruise"] == 1
       ret.cruiseState.standstill = cp_cam.vl["ES_DashStatus"]["Cruise_State"] == 3
       ret.stockFcw = (cp_cam.vl["ES_LKAS_State"]["LKAS_Alert"] == 1) or \
                      (cp_cam.vl["ES_LKAS_State"]["LKAS_Alert"] == 2)
 
       self.es_lkas_state_msg = copy.copy(cp_cam.vl["ES_LKAS_State"])
-      cp_es_brake = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp_cam
       self.es_brake_msg = copy.copy(cp_es_brake.vl["ES_Brake"])
-      cp_es_status = cp_alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else cp_cam
 
       # TODO: Hybrid cars don't have ES_Distance, need a replacement
       if not (self.CP.flags & SubaruFlags.HYBRID):
@@ -114,7 +140,7 @@ class CarState(CarStateBase):
         ret.stockAeb = (cp_es_distance.vl["ES_Brake"]["AEB_Status"] == 8) and \
                        (cp_es_distance.vl["ES_Brake"]["Brake_Pressure"] != 0)
 
-        self.es_status_msg = copy.copy(cp_es_status.vl["ES_Status"])
+        self.es_status_msg = copy.copy(cp_es_brake.vl["ES_Status"])
         self.cruise_control_msg = copy.copy(cp_cruise.vl["CruiseControl"])
 
     if not (self.CP.flags & SubaruFlags.HYBRID):
@@ -137,8 +163,12 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
-    return {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.main),
+    avh_messages = [("AVH", 0)] if CP.carFingerprint in SUBARU_AVH_CARS else []
+    parsers = {
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.main_for_cp(CP)),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.camera),
-      Bus.alt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.alt)
+      Bus.alt: CANParser(DBC[CP.carFingerprint][Bus.pt], avh_messages, CanBus.alt_for_cp(CP))
     }
+    if CP.flags & SubaruFlags.D_PLATFORM:
+      parsers[Bus.main] = CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.main)
+    return parsers

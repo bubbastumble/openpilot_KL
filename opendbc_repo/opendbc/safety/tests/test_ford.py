@@ -61,6 +61,7 @@ class Buttons:
 
 
 # Ford safety has four different configurations tested here:
+#  * CAN with stock longitudinal
 #  * CAN with openpilot longitudinal
 #  * CAN FD with stock longitudinal
 #  * CAN FD with openpilot longitudinal
@@ -74,6 +75,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
                                MSG_LateralMotionControl2, MSG_IPMA_Data]}
 
   STEER_MESSAGE = 0
+  STOCK_LONGITUDINAL = False
 
   # Curvature control limits
   LKA_STEERING = False
@@ -197,6 +199,17 @@ class TestFordSafetyBase(common.CarSafetyTest):
       "TjaButtnOnOffPress": 1 if button == Buttons.TJA_TOGGLE else 0,
     }
     return self.packer.make_can_msg_safety("Steering_Data_FD1", bus, values)
+
+  def _combined_cancel_resume_msg(self, pressed: bool):
+    values = {"CcAslButtnCnclResPress": int(pressed)}
+    return self.packer.make_can_msg_safety("Steering_Data_FD1", 0, values)
+
+  def _pcm_main_on_msg(self, main_on: bool):
+    values = {
+      "BpedDrvAppl_D_Actl": 1,
+      "CcStat_D_Actl": 3 if main_on else 0,
+    }
+    return self.packer.make_can_msg_safety("EngBrakeData", 0, values)
 
   def test_rx_hook(self):
     # checksum, counter, and quality flag checks
@@ -380,6 +393,25 @@ class TestFordSafetyBase(common.CarSafetyTest):
       for bus in (0, 2):
         self.assertEqual(enabled, self._tx(self._acc_button_msg(Buttons.CANCEL, bus)))
 
+  def test_stock_resume_relay_requires_physical_button_and_cruise_main(self):
+    self.safety.set_controls_allowed(False)
+    self._rx(self._pcm_main_on_msg(True))
+    for bus in (0, 2):
+      self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+
+    self._rx(self._combined_cancel_resume_msg(True))
+    for bus in (0, 2):
+      self.assertEqual(self.STOCK_LONGITUDINAL, self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+
+    self._rx(self._combined_cancel_resume_msg(False))
+    for bus in (0, 2):
+      self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+
+    self._rx(self._pcm_main_on_msg(False))
+    self._rx(self._combined_cancel_resume_msg(True))
+    for bus in (0, 2):
+      self.assertFalse(self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+
   def _toggle_aol(self, toggle_on):
     # EngBrakeData, CcStat_D_Actl is the cruise state
     # 3 is standby (main on), 5 is active (engaged)
@@ -393,6 +425,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
 class TestFordCANFDStockSafety(TestFordSafetyBase):
   STEER_MESSAGE = MSG_LateralMotionControl2
+  STOCK_LONGITUDINAL = True
 
   TX_MSGS = [
     [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
@@ -409,6 +442,63 @@ class TestFordCANFDStockSafety(TestFordSafetyBase):
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.CANFD)
     self.safety.init_tests()
+
+  def _extended_lka_msg(self, angle_mode=False, shadow_curvature=0.0):
+    msg = self._lkas_command_msg(0)
+    raw_shadow = int(round(shadow_curvature / 1e-6)) & 0xFFFF
+    msg[0].data[4] |= 0x2 | int(angle_mode)
+    msg[0].data[5] = raw_shadow >> 8
+    msg[0].data[6] = raw_shadow & 0xFF
+    return msg
+
+  def test_extended_curvature_signals(self):
+    speed = 15.0
+    self.safety.set_controls_allowed(True)
+    self._reset_curvature_measurement(0.0, speed)
+    self.assertTrue(self._tx(self._extended_lka_msg()))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0.0, 0.0, 0.001, 0.0005)))
+
+    self.assertTrue(self._tx(self._extended_lka_msg()))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.1, 0.0, 0.001, 0.0005)))
+
+  def test_extended_angle_signals(self):
+    speed = 15.0
+    curvature = 0.005
+    self.safety.set_controls_allowed(True)
+    self._reset_curvature_measurement(curvature, speed)
+    self.assertTrue(self._tx(self._extended_lka_msg(angle_mode=True, shadow_curvature=curvature)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0.0, 0.02, 0.0, 0.0)))
+
+    self.assertTrue(self._tx(self._extended_lka_msg(angle_mode=True, shadow_curvature=curvature)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.0, 0.2, 0.0, 0.0)))
+
+    self.assertTrue(self._tx(self._extended_lka_msg(angle_mode=True, shadow_curvature=-curvature)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.0, 0.01, 0.0, 0.0)))
+
+
+class TestFordStockSafety(TestFordSafetyBase):
+  STEER_MESSAGE = MSG_LateralMotionControl
+  STOCK_LONGITUDINAL = True
+
+  TX_MSGS = [
+    [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
+    [MSG_LateralMotionControl, 0], [MSG_IPMA_Data, 0],
+  ]
+  RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
+                                 MSG_IPMA_Data)}
+
+  FWD_BLACKLISTED_ADDRS = {2: [MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
+                               MSG_IPMA_Data]}
+
+  def setUp(self):
+    self.packer = CANPackerSafety("ford_lincoln_base_pt")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, 0)
+    self.safety.init_tests()
+
+  def test_max_lateral_acceleration(self):
+    # CAN does not limit curvature from lateral acceleration
+    pass
 
 
 class TestFordLongitudinalSafetyBase(TestFordSafetyBase):
@@ -477,8 +567,7 @@ class TestFordLongitudinalSafety(TestFordLongitudinalSafetyBase):
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
-    # Make sure we enforce long safety even without long flag for CAN
-    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL)
     self.safety.init_tests()
 
   def test_max_lateral_acceleration(self):
@@ -492,7 +581,7 @@ class TestFordLKASteeringSafety(TestFordLongitudinalSafety):
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
-    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LKA_STEERING)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.LKA_STEERING)
     self.safety.init_tests()
 
 

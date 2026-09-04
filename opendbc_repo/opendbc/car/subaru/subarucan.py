@@ -13,13 +13,13 @@ def create_steering_control(packer, apply_torque, steer_req):
   return packer.make_can_msg("ES_LKAS", 0, values)
 
 
-def create_steering_control_angle(packer, apply_torque, steer_req):
+def create_steering_control_angle(packer, apply_angle, steer_req, bus=CanBus.main):
   values = {
-    "LKAS_Output": apply_torque,
+    "LKAS_Output": apply_angle,
     "LKAS_Request": steer_req,
     "SET_3": 3
   }
-  return packer.make_can_msg("ES_LKAS_ANGLE", 0, values)
+  return packer.make_can_msg("ES_LKAS_ANGLE", bus, values)
 
 
 def create_steering_status(packer):
@@ -67,7 +67,8 @@ def create_es_distance(packer, frame, es_distance_msg, bus, pcm_cancel_cmd, long
   return packer.make_can_msg("ES_Distance", bus, values)
 
 
-def create_es_lkas_state(packer, frame, es_lkas_state_msg, enabled, visual_alert, left_line, right_line, left_lane_depart, right_lane_depart):
+def create_es_lkas_state(packer, frame, es_lkas_state_msg, enabled, visual_alert, left_line, right_line, left_lane_depart, right_lane_depart,
+                         bus=CanBus.main):
   values = {s: es_lkas_state_msg[s] for s in [
     "CHECKSUM",
     "LKAS_Alert_Msg",
@@ -123,15 +124,16 @@ def create_es_lkas_state(packer, frame, es_lkas_state_msg, enabled, visual_alert
     values["LKAS_ACTIVE"] = 1  # Show LKAS lane lines
     values["LKAS_Dash_State"] = 2  # Green enabled indicator
   else:
+    values["LKAS_ACTIVE"] = 0
     values["LKAS_Dash_State"] = 0  # LKAS Not enabled
 
   values["LKAS_Left_Line_Visible"] = int(left_line)
   values["LKAS_Right_Line_Visible"] = int(right_line)
 
-  return packer.make_can_msg("ES_LKAS_State", CanBus.main, values)
+  return packer.make_can_msg("ES_LKAS_State", bus, values)
 
 
-def create_es_dashstatus(packer, frame, dashstatus_msg, enabled, long_enabled, long_active, lead_visible):
+def create_es_dashstatus(packer, frame, dashstatus_msg, enabled, long_enabled, long_active, lead_visible, bus=CanBus.main):
   values = {s: dashstatus_msg[s] for s in [
     "CHECKSUM",
     "PCB_Off",
@@ -177,10 +179,61 @@ def create_es_dashstatus(packer, frame, dashstatus_msg, enabled, long_enabled, l
   if values["LKAS_State_Msg"] in (2, 3):
     values["LKAS_State_Msg"] = 0
 
-  return packer.make_can_msg("ES_DashStatus", CanBus.main, values)
+  return packer.make_can_msg("ES_DashStatus", bus, values)
 
 
-def create_es_brake(packer, frame, es_brake_msg, long_enabled, long_active, brake_value):
+def create_stop_start_control(packer, dashlights_msg, raw_dat=None, counter=None, bus=CanBus.alt):
+  """Create the supported Subaru momentary Stop/Start button request.
+
+  Dashlights is a stock periodic message, so preserve the live frame and only
+  change the counter, event bit, and checksum. The raw frame is needed because
+  the DBC does not describe every byte in this message.
+  """
+  if raw_dat:
+    dat = bytearray(raw_dat)
+    if len(dat) != 8:
+      raise ValueError(f"Dashlights frame must be 8 bytes, got {len(dat)}")
+    if counter is None:
+      counter = (int(dashlights_msg.get("COUNTER", 0)) + 1) % 0x10
+    dat[1] = (dat[1] & 0xF0) | (counter % 0x10)
+    dat[6] |= 0x40  # STOP_START, big-endian bit 54
+    dat[0] = ((0x390 & 0xFF) + ((0x390 >> 8) & 0xFF) + sum(dat[1:])) & 0xFF
+    return 0x390, bytes(dat), bus
+
+  values = dict(dashlights_msg)
+  if counter is None:
+    counter = (int(values.get("COUNTER", 0)) + 1) % 0x10
+  values["COUNTER"] = counter % 0x10
+  values["STOP_START"] = 1
+  return packer.make_can_msg("Dashlights", bus, values)
+
+
+def create_avh_control(packer, avh_msg, raw_dat=None, counter=None, bus=CanBus.alt):
+  """Create the supported Subaru Legacy AVH ON request.
+
+  AVH is carried in the live 0x32b frame. Preserve the other bytes and update
+  only the rolling counter, AVH bit, and Subaru additive checksum.
+  """
+  if raw_dat:
+    dat = bytearray(raw_dat)
+    if len(dat) != 8:
+      raise ValueError(f"AVH frame must be 8 bytes, got {len(dat)}")
+    if counter is None:
+      counter = (int(avh_msg.get("COUNTER", 0)) + 1) % 0x10
+    dat[1] = (dat[1] & 0xF0) | (counter % 0x10)
+    dat[5] |= 0x20  # AVH, big-endian bit 45
+    dat[0] = ((0x32B & 0xFF) + ((0x32B >> 8) & 0xFF) + sum(dat[1:])) & 0xFF
+    return 0x32B, bytes(dat), bus
+
+  values = dict(avh_msg)
+  if counter is None:
+    counter = (int(values.get("COUNTER", 0)) + 1) % 0x10
+  values["COUNTER"] = counter % 0x10
+  values["AVH"] = 1
+  return packer.make_can_msg("AVH", bus, values)
+
+
+def create_es_brake(packer, frame, es_brake_msg, long_enabled, long_active, brake_value, bus=CanBus.main):
   values = {s: es_brake_msg[s] for s in [
     "CHECKSUM",
     "Signal1",
@@ -204,10 +257,10 @@ def create_es_brake(packer, frame, es_brake_msg, long_enabled, long_active, brak
     values["Cruise_Brake_Active"] = brake_value > 0
     values["Cruise_Brake_Lights"] = brake_value >= 70
 
-  return packer.make_can_msg("ES_Brake", CanBus.main, values)
+  return packer.make_can_msg("ES_Brake", bus, values)
 
 
-def create_es_status(packer, frame, es_status_msg, long_enabled, long_active, cruise_rpm):
+def create_es_status(packer, frame, es_status_msg, long_enabled, long_active, cruise_rpm, bus=CanBus.main):
   values = {s: es_status_msg[s] for s in [
     "CHECKSUM",
     "Signal1",
@@ -227,10 +280,10 @@ def create_es_status(packer, frame, es_status_msg, long_enabled, long_active, cr
 
     values["Cruise_Activated"] = long_active
 
-  return packer.make_can_msg("ES_Status", CanBus.main, values)
+  return packer.make_can_msg("ES_Status", bus, values)
 
 
-def create_es_infotainment(packer, frame, es_infotainment_msg, visual_alert):
+def create_es_infotainment(packer, frame, es_infotainment_msg, visual_alert, bus=CanBus.main):
   # Filter stock LKAS disabled and Keep hands on steering wheel OFF alerts
   values = {s: es_infotainment_msg[s] for s in [
     "CHECKSUM",
@@ -253,7 +306,7 @@ def create_es_infotainment(packer, frame, es_infotainment_msg, visual_alert):
   if visual_alert == VisualAlert.fcw:
     values["LKAS_State_Infotainment"] = 2
 
-  return packer.make_can_msg("ES_Infotainment", CanBus.main, values)
+  return packer.make_can_msg("ES_Infotainment", bus, values)
 
 
 def create_es_highbeamassist(packer):

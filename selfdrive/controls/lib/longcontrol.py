@@ -18,6 +18,8 @@ MOVING_STOP_FOLLOW_MIN_GAP = 0.25
 NEGATIVE_TARGET_CREEP_GUARD_SPEED = 0.35
 NEGATIVE_TARGET_CREEP_GUARD_DECEL = 0.40
 MODE_TRANSITION_MAX_DECEL = 4.0
+TESLA_PEDAL_RELEASE_GUARD_TIME = 0.15
+TESLA_PEDAL_RELEASE_GUARD_MAX_DECEL = 0.35
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -125,13 +127,12 @@ class LongControl:
     self._mode_setup()
     self.last_output_accel = 0.0
     self.stop_release_counter = 0
+    self.pedal_override_active = False
+    self.pedal_override_release_frames = 0
     self.vehicle_tuning = LongControlVehicleTuning(CP)
 
   def update_mpc_mode(self, experimental_mode):
     new_mode = 'blended' if experimental_mode else 'acc'
-
-    if self.transitioning and self.prev_mode == 'blended' and self.current_mode == 'acc':
-      self.mode_transition_timer = 0.0
 
     if new_mode != self.current_mode:
       self.prev_mode = self.current_mode
@@ -229,11 +230,23 @@ class LongControl:
     return min(output_accel, float(positive_cap))
 
   def update(self, active, CS, a_target, should_stop, accel_limits, starpilot_toggles, has_lead=False,
-             traffic_mode_enabled=False, profile_max_accel=0.0):
+             traffic_mode_enabled=False, profile_max_accel=0.0, pedal_override=False, leads=None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
+    if pedal_override:
+      self.pedal_override_active = True
+      self.pedal_override_release_frames = 0
+      return 0.0
+
+    if self.pedal_override_active:
+      self.pedal_override_active = False
+      self.pedal_override_release_frames = max(
+        1, int(round(TESLA_PEDAL_RELEASE_GUARD_TIME / DT_CTRL)),
+      )
+
+    previous_long_control_state = self.long_control_state
     allow_stopping_release = self._stop_release_ready(CS, a_target, should_stop, has_lead, starpilot_toggles)
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
@@ -248,6 +261,9 @@ class LongControl:
       if output_accel > starpilot_toggles.stopAccel:
         output_accel = min(output_accel, 0.0)
         output_accel -= starpilot_toggles.stoppingDecelRate * DT_CTRL
+      output_accel = self.vehicle_tuning.shape_stopping_accel(
+        output_accel, a_target, should_stop, CS.vEgo, has_lead, starpilot_toggles.stopAccel,
+      )
       output_accel = self._apply_moving_stop_target_follow(output_accel, a_target, should_stop, CS, starpilot_toggles)
       self.reset(preserve_stop_release=True)
 
@@ -270,9 +286,24 @@ class LongControl:
 
     else:  # LongCtrlState.pid
       a_target = self.vehicle_tuning.shape_gm_truck_accel_target(a_target, CS.vEgo, should_stop)
+      a_target = self.vehicle_tuning.shape_toyota_corolla_accel_target(
+        a_target, CS.vEgo, should_stop, self.last_output_accel,
+      )
+      a_target = self.vehicle_tuning.shape_toyota_sienna_accel_target(
+        a_target, CS.vEgo, should_stop, leads=leads,
+      )
+      a_target = self.vehicle_tuning.cap_toyota_sienna_lead_departure_accel(
+        a_target, CS.vEgo, leads=leads,
+      )
+      a_target = self.vehicle_tuning.shape_hyundai_elantra_lead_target(
+        a_target, CS.vEgo, should_stop, leads,
+      )
       error = a_target - CS.aEgo
       self.update_mpc_mode(self.experimental_mode)
       self.vehicle_tuning.shape_volt_test_tune_integrator(self.pid, error, CS.vEgo)
+      self.vehicle_tuning.trim_volt_cruise_integrator(
+        self.pid, a_target, error, CS.vEgo, should_stop, has_lead,
+      )
       self._trim_positive_overshoot_integrator(a_target, error, CS)
       self.vehicle_tuning.trim_gm_truck_positive_hold_integrator(
         self.pid, self.last_output_accel, a_target, error, CS,
@@ -286,13 +317,33 @@ class LongControl:
       freeze_integrator = self.vehicle_tuning.get_integrator_freeze(
         self.last_output_accel, a_target, error, CS.vEgo, accel_limits,
       )
+      leaving_experimental = self.transitioning and self.prev_mode == 'blended' and self.current_mode == 'acc'
+      if leaving_experimental:
+        freeze_integrator = True
       raw_output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=feedforward,
                                          freeze_integrator=freeze_integrator)
       raw_output_accel = self._cap_positive_output_on_negative_target(raw_output_accel, a_target, error, CS)
       raw_output_accel = self.vehicle_tuning.apply_pedal_long_brake_bias(raw_output_accel, a_target, CS)
+      raw_output_accel = self.vehicle_tuning.apply_bolt_start_handoff_floor(
+        raw_output_accel,
+        self.last_output_accel,
+        a_target,
+        CS.vEgo,
+        previous_long_control_state == LongCtrlState.starting,
+        should_stop,
+        has_lead,
+      )
+      raw_output_accel = self.vehicle_tuning.cap_hyundai_elantra_lead_output(
+        raw_output_accel, CS.vEgo, should_stop, leads,
+      )
 
-
-      if self.transitioning and self.prev_mode == 'acc' and self.current_mode == 'blended':
+      if leaving_experimental:
+        if raw_output_accel > self.last_output_accel:
+          progress = min(1.0, self.mode_transition_timer / max(self.mode_transition_duration, 1e-3))
+          output_accel = self.last_output_accel + (raw_output_accel - self.last_output_accel) * progress
+        else:
+          output_accel = raw_output_accel
+      elif self.transitioning and self.prev_mode == 'acc' and self.current_mode == 'blended':
         if raw_output_accel < 0 and raw_output_accel < self.last_output_accel:
           progress = min(1.0, self.mode_transition_timer / self.mode_transition_duration)
           # Soften transition at low urgency, but keep sharp for high decel
@@ -305,6 +356,17 @@ class LongControl:
           output_accel = raw_output_accel
       else:
         output_accel = raw_output_accel
+
+      output_accel = self.vehicle_tuning.cap_subaru_stop_release_accel(
+        output_accel,
+        previous_long_control_state == LongCtrlState.stopping and CS.vEgo < self.CP.vEgoStarting and not should_stop,
+        should_stop,
+      )
+
+    if self.pedal_override_release_frames > 0:
+      self.pedal_override_release_frames -= 1
+      if not should_stop and -TESLA_PEDAL_RELEASE_GUARD_MAX_DECEL < output_accel < 0.0:
+        output_accel = 0.0
 
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

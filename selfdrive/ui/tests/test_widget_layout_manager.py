@@ -1,49 +1,7 @@
-import sys
-import types
 import unittest
-from unittest.mock import MagicMock
+import pyray as rl
 
-# Create minimal mocks for imports so the tests can run headlessly.
-rl = types.SimpleNamespace(
-  Rectangle=lambda x=0, y=0, width=0, height=0: types.SimpleNamespace(x=x, y=y, width=width, height=height),
-  check_collision_point_rec=lambda p, r: (r.x <= p.x <= r.x + r.width) and (r.y <= p.y <= r.y + r.height),
-)
-sys.modules["pyray"] = rl
-
-ui_state = types.SimpleNamespace(
-  is_metric=True,
-  params=MagicMock(),
-)
-sys.modules["openpilot.selfdrive.ui.ui_state"] = types.SimpleNamespace(ui_state=ui_state)
-
-# Mock openpilot.system.ui.widgets
-widgets_mod = types.ModuleType("openpilot.system.ui.widgets")
-class MockWidget:
-  def __init__(self):
-    self.rect = rl.Rectangle()
-    self._children = []
-  def _child(self, w):
-    self._children.append(w)
-    return w
-  def set_rect(self, rect):
-    self.rect = rect
-  def render(self, rect):
-    self.rect = rect
-widgets_mod.Widget = MockWidget
-sys.modules["openpilot.system.ui.widgets"] = widgets_mod
-
-# Expose concrete widgets module with a mock base class
-widgets_starpilot_base = types.ModuleType("openpilot.selfdrive.ui.onroad.starpilot.widgets.base")
-class LayoutWidget(MockWidget):
-  def __init__(self, name: str, priority: int):
-    super().__init__()
-    self.name = name
-    self.priority = priority
-widgets_starpilot_base.LayoutWidget = LayoutWidget
-sys.modules["openpilot.selfdrive.ui.onroad.starpilot.widgets.base"] = widgets_starpilot_base
-
-
-# Now we can import our WidgetLayoutManager
+from openpilot.selfdrive.ui.onroad.starpilot.widgets.base import LayoutWidget
 from openpilot.selfdrive.ui.onroad.starpilot.widget_layout_manager import WidgetLayoutManager
 
 
@@ -221,8 +179,20 @@ class TestWidgetLayoutManager(unittest.TestCase):
     self.assertEqual(w2.rect.x, 1934)
     self.assertEqual(w2.rect.y, 290)
 
+  def test_right_center_zone_is_centered_on_the_right_widget_column(self):
+    w1 = DummyLayoutWidget("model_source", priority=1, width=300, height=208)
+    self.layout_manager.register_widget("right_center", w1)
+
+    self.layout_manager.update_layout(self.content_rect, is_rhd=False)
+
+    # The 300px widget needs a 150px inset to remain inside the content rect.
+    # center_x = 30 + 2100 - 150 = 1980; center_y = 30 + 1020 / 2 = 540
+    self.assertEqual(w1.rect.x, 1830)
+    self.assertEqual(w1.rect.y, 436)
+    self.assertEqual(w1.rect.width, 300)
+    self.assertEqual(w1.rect.height, 208)
+
 
 
 if __name__ == "__main__":
   unittest.main()
-

@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, function
+from tinygrad import Tensor, function, Device
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops
 
@@ -51,6 +51,11 @@ class TestCall(unittest.TestCase):
 
     np.testing.assert_allclose(a.grad.numpy(), gt_a_grad, rtol=1e-5)
     np.testing.assert_allclose(b.grad.numpy(), gt_b_grad, rtol=1e-5)
+
+  def test_call_scalar_param_shape_mismatch(self):
+    scalar_fxn = UOp.param(0, dtypes.float, ()) * 2
+    with self.assertRaisesRegex(TypeError, "shape mismatch: expected scalar"):
+      Tensor.call(Tensor.ones(2), fxn=scalar_fxn).realize()
 
   def test_call_gemm(self):
     M, K, N = 4, 8, 4
@@ -212,6 +217,33 @@ class TestCallSchedule(unittest.TestCase):
     out = f(a, v.bind(5))
     np.testing.assert_allclose(out.numpy(), [5., 10., 15.])
 
+  def test_precompile_scoped_bind_arg(self):
+    @function(precompile=True)
+    def f(x:Tensor, scale:UOp) -> Tensor: return x * scale
+    a = Tensor.ones(3)
+    x = f(a, UOp.variable("scale_a", 1, 100).bind(2))
+    y = f(a, UOp.variable("scale_b", 1, 100).bind(3))
+    fx = next(u for u in x.uop.toposort() if u.op is Ops.CALL and u.num_returned)
+    fy = next(u for u in y.uop.toposort() if u.op is Ops.CALL and u.num_returned)
+    self.assertEqual(fx.src[0].key, fy.src[0].key)
+    np.testing.assert_equal(x.numpy(), [2, 2, 2])
+    np.testing.assert_equal(y.numpy(), [3, 3, 3])
+
+  def test_precompile_nested_scope_collision(self):
+    # a precompiled function body gets its own positional p{slot} params; they must not be renumbered when the call is
+    # scheduled inside an enclosing realize with a different slot ordering. the store must use this call's Variable
+    cache = Tensor.zeros(16)
+    @function(precompile=True, allow_implicit=True)
+    def store(x:Tensor, sp:UOp) -> Tensor:
+      # update a cache at a symbolic offset, like an attention KV cache update
+      return Tensor(cache.uop.after(cache[sp:sp+x.shape[0]].uop.store(x.uop)))[:sp+x.shape[0]].sum()
+    sp_v, nt_v = UOp.variable("sp", 0, 8), UOp.variable("nt", 1, 8)
+    t = Tensor.arange(16).float().realize()
+    sp, nt = sp_v.bind(0), nt_v.bind(8)
+    store(t[sp:sp+nt].clone().realize(), sp).realize()
+    np.testing.assert_equal(cache.numpy()[:8], t[:8].numpy())
+    np.testing.assert_equal(cache.numpy()[8:], np.zeros(8))
+
   def test_precompile_schedule_cache_hit(self):
     """two instances of the same @function should produce identical function body keys (schedule cache hit)"""
     @function(precompile=True)
@@ -219,10 +251,10 @@ class TestCallSchedule(unittest.TestCase):
     a = Tensor.empty(4, 8)
     b = Tensor.empty(4, 8)
     r0, r1 = f(a), f(b)
-    # find the FUNCTION nodes
-    c0 = next(u for u in r0.uop.toposort() if u.op is Ops.FUNCTION)
-    c1 = next(u for u in r1.uop.toposort() if u.op is Ops.FUNCTION)
-    # the function bodies (src[0]) should have identical keys — unique consts must not leak through
+    # find the call nodes
+    c0 = next(u for u in r0.uop.toposort() if u.op is Ops.CALL and u.num_returned)
+    c1 = next(u for u in r1.uop.toposort() if u.op is Ops.CALL and u.num_returned)
+    # the function bodies (src[0]) should have identical keys
     self.assertEqual(c0.src[0].key, c1.src[0].key)
 
   def test_precompile_symbolic_2d(self):
@@ -243,6 +275,54 @@ class TestCallSchedule(unittest.TestCase):
     a = Tensor.arange(8).reshape(4, 2).float().clone().shard(devs, axis=0)
     out = f(a) + 2
     np.testing.assert_allclose(out.numpy(), np.arange(8, dtype=np.float32).reshape(4, 2) + 3)
+
+class TestArgOrder(unittest.TestCase):
+  """RETURNED placeholders can appear anywhere in a call's srcs: slots are src positions, nothing reorders"""
+  def make_intersperse_call(self, x, precompile=False):
+    # call with sources (body, returned(slot=0), input(slot=1)): the input is the input, the output binds the RETURNED
+    dev = x.device if isinstance(x.device, str) else (x.device or (Device.DEFAULT,))[0]
+    r0 = UOp.returned(0, x.dtype, x.shape, device=dev)
+    o0 = UOp.param(0, x.dtype, x.shape, dev)
+    p1 = UOp.param(1, x.dtype, x.shape, dev)
+    from tinygrad.uop.ops import CallInfo
+    return UOp(Ops.CALL, src=(UOp.sink(o0.store(p1.reshape(x.shape) * 2)), r0, x.uop),
+               arg=CallInfo(None, 't', precompile, False, None))
+
+  def test_intersperse_returned(self):
+    x = Tensor.arange(3, dtype=dtypes.int).realize()
+    call = self.make_intersperse_call(x)
+    out = Tensor(call.returned_outputs[0], device=x.device) + 1
+    np.testing.assert_equal(out.numpy(), [1, 3, 5])
+
+  def test_intersperse_returned_precompile(self):
+    x = Tensor.arange(3, dtype=dtypes.int).realize()
+    call = self.make_intersperse_call(x, precompile=True)
+    # the transform must preserve the RETURNED's src position: its placeholder is at src 1, the input stays at src 2
+    from tinygrad.tensor import transform_precompiled_call
+    new = transform_precompiled_call(call)
+    new_call = new.src[0].src[1].src[1]
+    # the out buffer takes the RETURNED's position (src 1), the input value keeps its position (src 2)
+    self.assertEqual(new_call.src[1].op, Ops.BUFFER)
+    self.assertEqual(new_call.src[1].arg.size, 3)
+    self.assertEqual(new_call.src[2].op, Ops.ADD)
+    # the body binds positionally: store dest at slot 0 (the RETURNED's position), input param at slot 1
+    store = [u for u in new_call.src[0].toposort(enter_calls=False) if u.op is Ops.STORE][0]
+    self.assertEqual(store.src[0].arg.slot, 0)
+    self.assertEqual([u.arg.slot for u in store.src[1].toposort(enter_calls=False) if u.op is Ops.PARAM], [1])
+
+  def test_intersperse_returned_gradient(self):
+    x = Tensor([1.0, 2.0, 3.0]).realize()
+    x.requires_grad = True
+    dev = x.device if isinstance(x.device, str) else (x.device or (Device.DEFAULT,))[0]
+    r0 = UOp.returned(0, dtypes.float, x.shape, device=dev)
+    o0 = UOp.param(0, dtypes.float, x.shape, dev)
+    p1 = UOp.param(1, dtypes.float, x.shape, dev)
+    from tinygrad.uop.ops import CallInfo
+    body = UOp.sink(o0.store(p1.reshape(x.shape) * p1.reshape(x.shape)))
+    call = UOp(Ops.CALL, src=(body, r0, x.uop), arg=CallInfo(None, 't', False, False, None))
+    y = Tensor(call.returned_outputs[0], device=x.device)
+    y.sum().backward()
+    np.testing.assert_equal(x.grad.numpy(), [2, 4, 6])
 
 class TestCallMultiSharded(unittest.TestCase):
   # TODO: multi-output + sharded needs per-device CALL execution, which requires reworking how MULTI propagates through TUPLE bodies
@@ -346,6 +426,16 @@ class TestCallMultiSharded(unittest.TestCase):
     c.sum().backward()
     np.testing.assert_allclose(a.grad.numpy(), b.numpy(), rtol=1e-5)
     np.testing.assert_allclose(b.grad.numpy(), a.numpy(), rtol=1e-5)
+
+  def test_symbolic_reshape_shard_axis(self):
+    toks = UOp.variable("toks", 1, 2).bind(2)
+    devs = ("CPU:0", "CPU:1")
+    x = Tensor(np.arange(16, dtype=np.float32).reshape(1, 2, 8)).shard(devs, axis=2).realize()
+    @function
+    def f(x:Tensor) -> Tensor: return x.reshape(1, x.shape[1], 2, 4)
+    out = f(x[:, :toks]).realize()
+    self.assertEqual(out.uop.axis, 2)
+    np.testing.assert_equal(out[:1, :2].to(devs[0]).numpy(), np.arange(16, dtype=np.float32).reshape(1, 2, 2, 4))
 
 if __name__ == '__main__':
   unittest.main()

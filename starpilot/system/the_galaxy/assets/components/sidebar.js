@@ -11,9 +11,12 @@ const MENU_ITEMS = {
   ],
   tools: [
     { name: "Toggles", link: "/device_settings", icon: "bi-toggle-on" },
+    { name: "Bluetooth", link: "/bluetooth", icon: "bi-bluetooth" },
     { name: "Download Speed Limits", link: "/download_speed_limits", icon: "bi-download" },
     { name: "Error Logs", link: "/manage_error_logs", icon: "bi-exclamation-triangle" },
     { name: "Galaxy", link: "/galaxy", icon: "bi-globe2" },
+    { name: "Sentry Mode", link: "/sentry", icon: "bi-shield-exclamation" },
+    { name: "Controllers", link: "/wheel-controls", icon: "bi-controller" },
     { name: "Lateral Tuning", link: "/tuning", icon: "bi-sign-turn-right" },
     { name: "Long Maneuvers", link: "/longitudinal_maneuvers", icon: "bi-signpost-split" },
     { name: "Maps", link: "/manage_maps", icon: "bi-map" },
@@ -24,6 +27,7 @@ const MENU_ITEMS = {
     { name: "Testing Ground", link: "/testing_ground", icon: "bi-bezier2" },
     { name: "Troubleshoot", link: "/troubleshoot", icon: "bi-tools" },
     { name: "V-Adj Spot Monitor", link: "/manage_v_asm", icon: "bi-eye" },
+    { name: "PiP Side Camera", link: "/manage_pip_sidecam", icon: "bi-badge-hd", developerOnly: true },
     { name: "Theme Maker", link: "/theme_maker", icon: "bi-palette-fill" },
     { name: "Tmux Log", link: "/manage_tmux", icon: "bi-terminal" },
     { name: "Backup and Restore", link: "/manage_toggles", icon: "bi-arrow-repeat" },
@@ -32,6 +36,8 @@ const MENU_ITEMS = {
   ],
 };
 
+let galaxyDeveloperMode = false;
+
 function matchesPath(currentPath, link) {
   if (link === "/") return currentPath === "/";
   if (link === "/tuning" && currentPath === "/lateral_maneuvers") return true;
@@ -39,7 +45,7 @@ function matchesPath(currentPath, link) {
 }
 
 function buildSectionMarkup(section, links, currentPath) {
-  const linksMarkup = links.map((link) => {
+  const linksMarkup = links.filter((link) => !link.developerOnly || galaxyDeveloperMode).map((link) => {
     const active = matchesPath(currentPath, link.link) ? "active" : "";
     return `
       <li class="${active}">
@@ -63,6 +69,21 @@ function buildSectionMarkup(section, links, currentPath) {
       </ul>
     </div>
   `;
+}
+
+async function refreshGalaxyDeveloperMode() {
+  try {
+    const response = await fetch("/api/params/all", { cache: "no-store" });
+    if (!response.ok) return;
+    const values = await response.json();
+    const next = Boolean(values?.GalaxyDeveloperMode);
+    if (next !== galaxyDeveloperMode) {
+      galaxyDeveloperMode = next;
+      renderSidebarIntoShell();
+    }
+  } catch (error) {
+    console.warn("Unable to determine Galaxy Developer Mode:", error);
+  }
 }
 
 function bindSidebarHandlers() {
@@ -135,6 +156,9 @@ function renderSidebarIntoShell(currentPath) {
 }
 
 export function Sidebar(currentPath) {
-  setTimeout(() => renderSidebarIntoShell(currentPath), 0);
+  setTimeout(() => {
+    renderSidebarIntoShell(currentPath);
+    refreshGalaxyDeveloperMode();
+  }, 0);
   return html`<div id="sidebar_shell"></div>`;
 }

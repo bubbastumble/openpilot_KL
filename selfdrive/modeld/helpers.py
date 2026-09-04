@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from tinygrad.device import Device
-from openpilot.system.hardware.usb import chestnut_present
+from openpilot.system.hardware.usb import chestnut_firmware_ready
 
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 TG_INPUT_DEVICES_PATH = MODELS_DIR / "tg_input_devices.json"
@@ -44,15 +44,11 @@ def _fallback_tg_devices(process_name: str, usbgpu: bool) -> dict[str, str]:
   if process_name == "selfdrive.modeld.dmonitoringmodeld":
     return {"DEV": backend}
 
-  queue_dev = backend
-  if usbgpu:
-    try:
-      available = {name.split(":", 1)[0] for name in Device.get_available_devices()}
-    except Exception:
-      available = set()
-    if "AMD" in available:
-      queue_dev = "AMD"
-  return {"WARP_DEV": backend, "QUEUE_DEV": queue_dev}
+  # The external-GPU profile is only selected after Chestnut has been
+  # recognized. Match upstream's generated device map and select AMD directly;
+  # probing every tinygrad backend opens CL/DSP/CPU devices inside modeld and
+  # can interfere with the on-road QCOM + AMD process.
+  return {"WARP_DEV": backend, "QUEUE_DEV": "AMD" if usbgpu else backend}
 
 
 def get_tg_input_devices(process_name: str, usbgpu: bool) -> dict[str, str]:
@@ -70,7 +66,7 @@ def modeld_pkl_path(usbgpu: bool) -> Path:
 
 
 def usbgpu_present() -> bool:
-  return chestnut_present()
+  return chestnut_firmware_ready()
 
 
 def tinygrad_dev_config(usbgpu: bool, tici: bool) -> str:

@@ -67,8 +67,12 @@ STARPILOT_PARAM_RENAME_MIGRATION_FLAG = Path("/data") / "starpilot_param_rename_
 STARPILOT_PARAM_CANONICALIZATION_MIGRATION_FLAG = Path("/data") / "starpilot_param_canonicalization_v1"
 STARPILOT_PC_ROOT_MIGRATION_FLAG = Path("/data") / "starpilot_pc_root_v1"
 STARPILOT_PARAMS_CACHE_MIGRATION_FLAG = Path("/data") / "starpilot_params_cache_v1"
+STARPILOT_DEFAULT_MODEL_MIGRATION_FLAG = Path("/data") / "starpilot_default_model_rdf_v4"
+STARPILOT_CE_MODEL_STOP_TIME_MIGRATION_FLAG = Path("/data") / "starpilot_ce_model_stop_time_v2"
 STARPILOT_LEGACY_CACHE_MARKER_KEYS = ("RemapCancelToDistance",)
-STARPILOT_REMOVED_PARAM_KEYS = ("CoastUpToLeads", "HumanAcceleration", "HumanFollowing", "PrioritizeSmoothFollowing")
+STARPILOT_REMOVED_PARAM_KEYS = (
+  "CoastUpToLeads", "HumanAcceleration", "HumanFollowing", "PrioritizeSmoothFollowing", "ReverseCruise",
+)
 LEGACY_CARMODEL_MIGRATIONS = {
   "CHEVROLET_BOLT_CC_2019_2021": "CHEVROLET_BOLT_CC_2018_2021",
 }
@@ -131,16 +135,34 @@ def get_nav_offroad_clear_timeout_seconds(params) -> int:
   return max(_get_int_param_value(params, "ClearNavOnOffroadTimeoutMinutes", 0), 0) * 60
 
 
-def update_nav_offroad_clear_state(params, started: bool, tracked_destination, tracked_started_at, now: float):
-  nav_destination = params.get("NavDestination")
-  if started or not params.get_bool("ClearNavOnOffroad") or not nav_destination:
+def update_nav_offroad_clear_state(
+  params,
+  started: bool,
+  tracked_destination,
+  tracked_started_at,
+  now: float,
+  *,
+  offroad_transition: bool,
+):
+  if started or not params.get_bool("ClearNavOnOffroad"):
     return None, None
 
-  if nav_destination != tracked_destination or tracked_started_at is None:
+  nav_destination = params.get("NavDestination")
+  if offroad_transition:
+    if not nav_destination:
+      return None, None
     tracked_destination = nav_destination
     tracked_started_at = now
+  elif tracked_destination is None or tracked_started_at is None:
+    return None, None
+
+  if nav_destination != tracked_destination:
+    return None, None
 
   if now - tracked_started_at >= get_nav_offroad_clear_timeout_seconds(params):
+    current_destination = params.get("NavDestination")
+    if current_destination != tracked_destination:
+      return None, None
     params.remove("NavDestination")
     return None, None
 
@@ -307,6 +329,44 @@ def migrate_legacy_starpilot_params_cache(params: Params, legacy_cache_root: str
     STARPILOT_PARAMS_CACHE_MIGRATION_FLAG.write_text(f"{datetime.datetime.now(datetime.UTC).isoformat()}\n")
   except Exception:
     cloudlog.exception(f"Failed to write migration flag: {STARPILOT_PARAMS_CACHE_MIGRATION_FLAG}")
+
+
+def _normalize_secoc_key(candidate) -> str | None:
+  if isinstance(candidate, bytes):
+    candidate = candidate.decode("utf-8", errors="ignore")
+  if not isinstance(candidate, str):
+    return None
+
+  candidate = candidate.strip()
+  try:
+    return candidate if len(bytes.fromhex(candidate)) == 16 else None
+  except ValueError:
+    return None
+
+
+def migrate_legacy_secoc_key(params: Params, params_cache: Params, legacy_cache_root: str | Path) -> None:
+  if _normalize_secoc_key(params.get("SecOCKey")) is not None or _normalize_secoc_key(params_cache.get("SecOCKey")) is not None:
+    return
+
+  legacy_cache_root = Path(legacy_cache_root)
+  candidates = []
+  try:
+    candidates.append(Params(str(legacy_cache_root)).get("SecOCKey"))
+  except Exception:
+    pass
+
+  try:
+    candidates.append((legacy_cache_root / "SecOCKey").read_text())
+  except OSError:
+    pass
+
+  for candidate in candidates:
+    normalized_key = _normalize_secoc_key(candidate)
+    if normalized_key is not None:
+      params.put("SecOCKey", normalized_key)
+      params_cache.put("SecOCKey", normalized_key)
+      cloudlog.warning("Recovered Toyota SecOC key from legacy params cache")
+      return
 
 
 def cleanup_removed_starpilot_params(params: Params, params_cache: Params) -> None:
@@ -521,8 +581,8 @@ def migrate_starpilot_default_parity(params: Params, params_cache: Params) -> No
     seeded_keys.append(key)
 
   if not _has_persisted_param_file(params, "CEModelStopTime") and not _has_persisted_param_file(params_cache, "CEModelStopTime"):
-    params.put_float("CEModelStopTime", 7.0)
-    params_cache.put_float("CEModelStopTime", 7.0)
+    params.put_float("CEModelStopTime", 7.7)
+    params_cache.put_float("CEModelStopTime", 7.7)
     seeded_keys.append("CEModelStopTime")
 
   # Rebase default regression fix:
@@ -548,6 +608,82 @@ def migrate_starpilot_default_parity(params: Params, params_cache: Params) -> No
     STARPILOT_DEFAULTS_PARITY_MIGRATION_FLAG.write_text(f"{datetime.datetime.now(datetime.UTC).isoformat()}\n")
   except Exception:
     cloudlog.exception(f"Failed to write migration flag: {STARPILOT_DEFAULTS_PARITY_MIGRATION_FLAG}")
+
+
+def migrate_starpilot_default_model(params: Params, params_cache: Params) -> None:
+  """Move the old bundled default to the bundled RDF V4 model once."""
+  if STARPILOT_DEFAULT_MODEL_MIGRATION_FLAG.exists():
+    return
+
+  def persisted_text(key: str) -> str:
+    for params_obj in (params, params_cache):
+      raw_value = _read_raw_param_bytes(params_obj, key)
+      if raw_value:
+        return _to_text(raw_value).strip()
+    return ""
+
+  selected_model = persisted_text("Model") or persisted_text("DrivingModel")
+  selected_version = persisted_text("ModelVersion") or persisted_text("DrivingModelVersion")
+  selected_name = persisted_text("DrivingModelName").lower()
+
+  is_legacy_default = selected_model.lower() in {"sc", "sc2", "rdf"}
+  is_legacy_metadata = (
+    not selected_version
+    or selected_version.lower() in {"v11", "v15"}
+  ) and (
+    not selected_name
+    or selected_name.startswith("south carolina")
+    or selected_name.startswith("regret driven framework")
+  )
+  if is_legacy_default and is_legacy_metadata:
+    for key, value in {
+      "Model": "rdf43",
+      "DrivingModel": "rdf43",
+      "DrivingModelName": "Regret Driven Framework V4",
+      "ModelVersion": "v15",
+      "DrivingModelVersion": "v15",
+    }.items():
+      params.put(key, value)
+      params_cache.put(key, value)
+    cloudlog.warning("Migrated the bundled default model to RDF V4")
+
+  try:
+    STARPILOT_DEFAULT_MODEL_MIGRATION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    STARPILOT_DEFAULT_MODEL_MIGRATION_FLAG.write_text(f"{datetime.datetime.now(datetime.UTC).isoformat()}\n")
+  except Exception:
+    cloudlog.exception(f"Failed to write migration flag: {STARPILOT_DEFAULT_MODEL_MIGRATION_FLAG}")
+
+
+def migrate_starpilot_ce_model_stop_time(params: Params, params_cache: Params) -> None:
+  """Move persisted users of the old 9-second stop prediction threshold to 7.7 once."""
+  if STARPILOT_CE_MODEL_STOP_TIME_MIGRATION_FLAG.exists():
+    return
+
+  legacy_default_detected = False
+  for params_obj in (params, params_cache):
+    raw_value = _read_raw_param_bytes(params_obj, "CEModelStopTime")
+    if not raw_value:
+      continue
+
+    try:
+      parsed_value = float(raw_value.decode("utf-8", errors="strict").strip())
+    except Exception:
+      continue
+
+    if abs(parsed_value - 9.0) < 1e-6:
+      legacy_default_detected = True
+      break
+
+  if legacy_default_detected:
+    params.put_float("CEModelStopTime", 7.7)
+    params_cache.put_float("CEModelStopTime", 7.7)
+    cloudlog.warning("Migrated CEModelStopTime from 9 seconds to 7.7 seconds")
+
+  try:
+    STARPILOT_CE_MODEL_STOP_TIME_MIGRATION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    STARPILOT_CE_MODEL_STOP_TIME_MIGRATION_FLAG.write_text(f"{datetime.datetime.now(datetime.UTC).isoformat()}\n")
+  except Exception:
+    cloudlog.exception(f"Failed to write migration flag: {STARPILOT_CE_MODEL_STOP_TIME_MIGRATION_FLAG}")
 
 
 def migrate_disable_humanlike_defaults(params: Params, params_cache: Params) -> None:
@@ -852,6 +988,7 @@ def manager_init() -> None:
   cache_params_path = Paths.params_cache_root()
   migrate_legacy_starpilot_params_cache(params, Paths.legacy_params_cache_root(), cache_params_path)
   params_cache = Params(cache_params_path, return_defaults=True)
+  migrate_legacy_secoc_key(params, params_cache, Paths.legacy_params_cache_root())
   last_timing = _log_boot_timing("manager_init", "params_cache", manager_init_start, last_timing)
 
   # Legacy FrogPilot params are unknown to the renamed schema and would be
@@ -883,6 +1020,8 @@ def manager_init() -> None:
   migrate_param_type_canonicalization(params)
   cleanup_removed_starpilot_params(params, params_cache)
   migrate_starpilot_default_parity(params, params_cache)
+  migrate_starpilot_default_model(params, params_cache)
+  migrate_starpilot_ce_model_stop_time(params, params_cache)
   migrate_disable_humanlike_defaults(params, params_cache)
   migrate_cluster_offset_default(params, params_cache)
   migrate_traffic_mode_smooth_defaults(params, params_cache)
@@ -957,11 +1096,6 @@ def manager_init() -> None:
                        device=HARDWARE.get_device_type())
   last_timing = _log_boot_timing("manager_init", "logging_ready", manager_init_start, last_timing)
 
-  # preimport all processes
-  for p in managed_processes.values():
-    p.prepare()
-  last_timing = _log_boot_timing("manager_init", "preimport_processes", manager_init_start, last_timing)
-
   # StarPilot variables
   install_starpilot(build_metadata, params)
   last_timing = _log_boot_timing("manager_init", "install_starpilot", manager_init_start, last_timing)
@@ -1004,7 +1138,7 @@ def manager_thread() -> None:
   last_timing = _log_boot_timing("manager_thread", "messaging", manager_thread_start, last_timing)
 
   write_onroad_params(False, params)
-  initial_toggles = get_starpilot_toggles()
+  initial_toggles = get_starpilot_toggles(read_persisted_force_params=True)
   last_timing = _log_boot_timing("manager_thread", "initial_toggles", manager_thread_start, last_timing)
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore, starpilot_toggles=initial_toggles)
   last_timing = _log_boot_timing("manager_thread", "initial_ensure_running", manager_thread_start, last_timing)
@@ -1020,7 +1154,7 @@ def manager_thread() -> None:
 
   params_memory = Params(memory=True)
 
-  starpilot_toggles = get_starpilot_toggles()
+  starpilot_toggles = get_starpilot_toggles(read_persisted_force_params=True)
   last_timing = _log_boot_timing("manager_thread", "loop_toggles", manager_thread_start, last_timing)
   _log_boot_timing("manager_thread", "loop_ready", manager_thread_start, last_timing)
 
@@ -1041,7 +1175,12 @@ def manager_thread() -> None:
       params_memory.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
 
     offroad_nav_destination, offroad_nav_started_at = update_nav_offroad_clear_state(
-      params, started, offroad_nav_destination, offroad_nav_started_at, time.monotonic()
+      params,
+      started,
+      offroad_nav_destination,
+      offroad_nav_started_at,
+      time.monotonic(),
+      offroad_transition=not started and started_prev,
     )
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
@@ -1094,7 +1233,7 @@ def manager_thread() -> None:
       break
 
     # StarPilot variables
-    starpilot_toggles = get_starpilot_toggles(sm)
+    starpilot_toggles = get_starpilot_toggles(sm, read_persisted_force_params=True)
 
 
 def main() -> None:

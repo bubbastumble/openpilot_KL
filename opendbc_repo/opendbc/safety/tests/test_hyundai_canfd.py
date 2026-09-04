@@ -441,6 +441,63 @@ class TestHyundaiCanfdLFASteeringAltButtons(TestHyundaiCanfdLFASteeringAltButton
   pass
 
 
+class TestHyundaiCanfdAltButtonFlagIsolation(unittest.TestCase):
+  TX_MSGS = []
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, HyundaiSafetyFlags.CANFD_ALT_BUTTONS)
+    self.safety.init_tests()
+
+  @staticmethod
+  def _button_msg(*, main=False, lka=False):
+    dat = bytearray(16)
+    dat[4] = (int(main) << 2) | (int(lka) << 7)
+    return libsafety_py.make_CANPacket(0x1AA, 0, bytes(dat))
+
+  def test_alt_buttons_do_not_enable_classic_main_lkas_sync(self):
+    self.safety.safety_rx_hook(self._button_msg(lka=True))
+    self.safety.safety_rx_hook(self._button_msg())
+    self.assertTrue(self.safety.get_lkas_on())
+    self.safety.safety_rx_hook(self._button_msg(main=True))
+    self.safety.safety_rx_hook(self._button_msg())
+    self.assertTrue(self.safety.get_lkas_on())
+
+
+class TestHyundaiCanfdCcncAltButtonResume(unittest.TestCase):
+  TX_MSGS = [[0x1AA, 2]]
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(
+      CarParams.SafetyModel.hyundaiCanfd,
+      HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_ALT_BUTTONS,
+    )
+    self.safety.init_tests()
+
+  def _resume_msg(self):
+    return self.packer.make_can_msg_safety(
+      "CRUISE_BUTTONS_ALT", 2, {"CRUISE_BUTTONS": Buttons.RESUME},
+    )
+
+  def test_resume_allowed_only_when_controls_are_allowed(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self.safety.safety_tx_hook(self._resume_msg()))
+
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self.safety.safety_tx_hook(self._resume_msg()))
+
+  def test_alternate_button_frame_is_blocked_without_flag(self):
+    self.safety.set_safety_hooks(
+      CarParams.SafetyModel.hyundaiCanfd,
+      HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.CAMERA_SCC,
+    )
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self.safety.safety_tx_hook(self._resume_msg()))
+
+
 class TestHyundaiCanfdCCNCSupportFrames(common.SafetyTestBase):
   TX_MSGS = [[0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
 
@@ -768,6 +825,21 @@ class TestHyundaiCanfdLKASteeringAltAngleLongEV(HyundaiLongitudinalBase, TestHyu
     for address, length in ((0x51, 32), (0x31A, 32), (0x3B5, 32), (0x3C1, 8)):
       with self.subTest(address=address):
         self.assertFalse(self._tx(common.make_msg(1 if address != 0x51 else 0, address, length)))
+
+  def test_ccnc_angle_fallback_allows_lateral_only(self):
+    fallback_param = (self.SAFETY_PARAM & ~HyundaiSafetyFlags.LONG) | HyundaiSafetyFlags.CCNC
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, fallback_param)
+    self.safety.init_tests()
+
+    self._rx(self._gear_msg(5))
+    self._reset_speed_measurement(self.STANDSTILL_THRESHOLD + 1)
+    self._reset_angle_measurement(0)
+    self._set_prev_desired_angle(0)
+    self.safety.set_controls_allowed(True)
+
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, enabled=True)))
+    self.assertFalse(self._tx(common.make_msg(1, 0x12A, 16)))
+    self.assertFalse(self._tx(common.make_msg(1, 0x1A0, 32)))
 
   def test_ccnc_angle_long_uses_second_mdps_angle(self):
     self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, self.SAFETY_PARAM | HyundaiSafetyFlags.CCNC)

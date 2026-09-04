@@ -1,4 +1,4 @@
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.common.params import Params
 from openpilot.selfdrive.ui.lib.starpilot_visuals import lead_indicator_enabled
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl, BigToggle
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog, BigMultiOptionDialog
@@ -11,17 +11,17 @@ CAMERA_VIEW_LABELS = ["Auto", "Driver", "Standard", "Wide", "None"]
 class CameraViewBigButton(BigButton):
   def __init__(self):
     super().__init__("camera view", "", gui_app.texture("icons_mici/onroad/eye_fill.png", 64, 64))
-    self._params = ui_state.params
+    self._params = Params()
     self.set_click_callback(self._show_selector)
     self.refresh()
 
   def refresh(self):
-    current_idx = self._params.get_int("CameraView", return_default=True, default=3)
+    current_idx = self._params.get_int("CameraView", return_default=True, default=2)
     current_idx = max(0, min(current_idx, len(CAMERA_VIEW_LABELS) - 1))
     self.set_value(CAMERA_VIEW_LABELS[current_idx].lower())
 
   def _show_selector(self):
-    current_idx = self._params.get_int("CameraView", return_default=True, default=3)
+    current_idx = self._params.get_int("CameraView", return_default=True, default=2)
     current_idx = max(0, min(current_idx, len(CAMERA_VIEW_LABELS) - 1))
     dialog_holder: dict[str, BigMultiOptionDialog] = {}
 
@@ -42,7 +42,7 @@ class CameraViewBigButton(BigButton):
 class LeadIndicatorBigButton(BigToggle):
   def __init__(self):
     super().__init__("lead indicator")
-    self.params = ui_state.params
+    self.params = Params()
     self.refresh()
 
   def _handle_mouse_release(self, mouse_pos):
@@ -63,7 +63,7 @@ class VisualsLayoutMici(NavScroller):
     self._torque_bar_btn = BigParamControl("torque bar", "EnableTorqueBarWidget")
     self._rainbow_path_btn = BigParamControl("rainbow road", "RainbowPath")
     self._lead_indicator_btn = LeadIndicatorBigButton()
-    self._speed_limit_signs_btn = BigParamControl("speed limit signs", "ShowSpeedLimits")
+    self._speed_limit_signs_btn = BigParamControl("show speed limits", "ShowSpeedLimits")
     self._slc_confirmation_btn = BigParamControl("confirm new speed limits", "SLCConfirmation")
     self._slc_confirmation_lower_btn = BigParamControl("confirm lower limits", "SLCConfirmationLower")
     self._slc_confirmation_higher_btn = BigParamControl("confirm higher limits", "SLCConfirmationHigher")

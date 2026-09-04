@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from openpilot.system.hardware import HARDWARE
 from openpilot.selfdrive.ui.lib.starpilot_state import starpilot_state
-from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 
@@ -52,7 +52,7 @@ class SteeringManagerView(CardHubManagerView):
     super().__init__(controller, [], **kwargs)
 
   def _build_cards(self):
-    return [
+    cards = [
       {
         "title": tr("Steering Behavior"),
         "desc": tr("Configure Always On Lateral (AOL), pause speed thresholds, and turn signal behaviors."),
@@ -72,6 +72,7 @@ class SteeringManagerView(CardHubManagerView):
         "on_click": lambda: self._controller._navigate_to("advanced"),
       },
     ]
+    return cards
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -107,6 +108,9 @@ class StarPilotLateralLayout(_SettingsPage):
 
     def nlc_on():
       return lc_on() and p.get_bool("NudgelessLaneChange")
+
+    def close_gap_on():
+      return lc_on() and p.get_bool("LaneChangeCloseGap")
 
     def pos_on():
       return p.get_bool("PauseLateralOnSignal")
@@ -191,6 +195,21 @@ class StarPilotLateralLayout(_SettingsPage):
         on_click=self._show_lane_smoothing,
         visible=lc_on,
       ),
+      SettingRow(
+        "LaneChangeCloseGap", "toggle", tr_noop("Close Gap On Lane Change"),
+        subtitle=tr_noop("Allows for a temporary shorter follow distance behind lead so that openpilot merges smoothly " +
+                         "out of current lane, it will allow car to accelerate as it changes lanes."),
+        get_state=lambda: p.get_bool("LaneChangeCloseGap"),
+        set_state=lambda s: p.put_bool("LaneChangeCloseGap", s),
+        visible=lc_on,
+      ),
+      SettingRow(
+        "LaneChangeCloseGapSeconds", "value", tr_noop("Temporary Follow Distance"),
+        subtitle=tr_noop("Follow distance to hold while changing lanes. Only applied when shorter than your normal gap."),
+        get_value=self._get_lane_change_close_gap_display,
+        on_click=lambda: self._show_slider("LaneChangeCloseGapSeconds", 0.25, 1.0, step=0.05, unit="s", value_type="float"),
+        visible=close_gap_on,
+      ),
     ]
 
     # ── 3. Advanced Lateral Tuning ──
@@ -266,8 +285,8 @@ class StarPilotLateralLayout(_SettingsPage):
       SettingRow(
         "SteerDelay", "value", tr_noop("Actuator Delay"),
         subtitle=tr_noop("Exact full delay between steering command and vehicle response."),
-        get_value=lambda: f"{p.get_float('SteerDelay'):.2f}s",
-        on_click=lambda: self._show_slider("SteerDelay", 0.01, 1.0, step=0.01, unit="s", value_type="float"),
+        get_value=lambda: f"{p.get_float('SteerDelay'):.3f}s",
+        on_click=lambda: self._show_slider("SteerDelay", 0.01, 1.0, step=0.001, unit="s", value_type="float"),
         enabled=lambda: not p.get_bool("UseAutoSteerDelay"),
         disabled_label=tr_noop("Disabled while auto-learned delay is enabled."),
         visible=lambda: alt_on() and cs.steerActuatorDelay != 0,
@@ -290,7 +309,8 @@ class StarPilotLateralLayout(_SettingsPage):
         "SteerLatAccel", "value", tr_noop("Lateral Acceleration"),
         subtitle=tr_noop("Maps steering torque to turning response."),
         get_value=lambda: f"{p.get_float('SteerLatAccel'):.2f}",
-        on_click=lambda: self._show_slider("SteerLatAccel", max(0.01, cs.latAccelFactor) * 0.5, max(0.01, cs.latAccelFactor) * 1.5, step=0.01, value_type="float"),
+        on_click=lambda: self._show_slider("SteerLatAccel", max(0.01, cs.latAccelFactor) * 0.5,
+                                           max(0.01, cs.latAccelFactor) * 1.5, step=0.01, value_type="float"),
         visible=lambda: alt_on() and cs.latAccelFactor != 0 and cs.isTorqueCar and not cs.isAngleCar,
       ),
       SettingRow(
@@ -374,6 +394,9 @@ class StarPilotLateralLayout(_SettingsPage):
     if val == 0 or val == 10:
       return tr("Stock")
     return str(val)
+
+  def _get_lane_change_close_gap_display(self) -> str:
+    return f"{self._params.get_float('LaneChangeCloseGapSeconds'):.2f}s"
 
   def _show_lane_smoothing(self):
     def on_close(res, val):

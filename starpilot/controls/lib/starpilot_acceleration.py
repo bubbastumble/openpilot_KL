@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import math
+
 import numpy as np
 
 from openpilot.common.constants import CV
@@ -8,6 +10,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import A_CRUISE_MIN, 
 
 from openpilot.starpilot.common.accel_profile import (
   ACCELERATION_PROFILES,
+  A_CRUISE_MAX_BP_CUSTOM,
   A_CRUISE_MAX_VALS_TRAFFIC_ALL,
   DECELERATION_PROFILES,
   coerce_custom_accel_profile_values,
@@ -76,6 +79,19 @@ SLC_COAST_MIN_SPEED = 4.0
 SLC_TARGET_EPS = 0.15
 RELEVANT_LEAD_MIN_CLOSING_SPEED = 0.5
 RELEVANT_LEAD_MIN_BRAKE = -0.4
+PULSE_GLIDE_MIN_TARGET_SPEED = 5.0
+PULSE_GLIDE_MIN_LOWER_SPEED = 3.0
+PULSE_GLIDE_HYSTERESIS = 0.25
+PULSE_GLIDE_COAST_MIN_ACCEL = -0.03
+PULSE_GLIDE_HILL_ENTER_PITCH = math.radians(3.0)
+PULSE_GLIDE_HILL_EXIT_PITCH = math.radians(2.5)
+
+# Drive mode -> profile mapping used by the map_acceleration / map_deceleration toggles.
+GEAR_STATE_PROFILES = {
+  "eco": (ACCELERATION_PROFILES["ECO"], DECELERATION_PROFILES["ECO"]),
+  "sport": (ACCELERATION_PROFILES["SPORT_PLUS"], DECELERATION_PROFILES["SPORT"]),
+  "normal": (ACCELERATION_PROFILES["STANDARD"], DECELERATION_PROFILES["STANDARD"]),
+}
 
 def get_max_accel_eco(v_ego, ev_tuning=True, truck_tuning=False):
   return interpolate_accel_profile(v_ego, get_accel_profile_curve_values(ACCELERATION_PROFILES["ECO"], ev_tuning, truck_tuning))
@@ -89,9 +105,16 @@ def get_max_accel_standard(v_ego, ev_tuning=True, truck_tuning=False):
 def get_max_accel_traffic(v_ego):
   return interpolate_accel_profile(v_ego, A_CRUISE_MAX_VALS_TRAFFIC_ALL)
 
-def get_max_accel_custom(v_ego, custom_curve, acceleration_profile, ev_tuning=True, truck_tuning=False):
-  curve_values = coerce_custom_accel_profile_values(custom_curve, acceleration_profile, ev_tuning, truck_tuning)
-  return interpolate_accel_profile(v_ego, curve_values)
+def get_max_accel_custom(v_ego, custom_curve, acceleration_profile, ev_tuning=True, truck_tuning=False, custom_breakpoints=None):
+  curve_breakpoints = A_CRUISE_MAX_BP_CUSTOM if custom_breakpoints is None else custom_breakpoints
+  curve_values = coerce_custom_accel_profile_values(
+    custom_curve,
+    acceleration_profile,
+    ev_tuning,
+    truck_tuning,
+    point_count=len(curve_breakpoints),
+  )
+  return interpolate_accel_profile(v_ego, curve_values, curve_breakpoints)
 
 def get_max_allowed_accel(v_ego, ev_tuning=True, truck_tuning=False):
   return float(get_profile_max_allowed_accel(v_ego, ev_tuning, truck_tuning))
@@ -135,11 +158,100 @@ class StarPilotAcceleration:
   def __init__(self, StarPilotPlanner):
     self.starpilot_planner = StarPilotPlanner
     self.params = Params()
+    self.params_memory = Params(memory=True)
 
     self.max_accel = 0
     self.min_accel = 0
 
     self.last_gear_state = "init"
+    self.pulse_glide_coasting = False
+    self.pulse_glide_target = None
+    self.pulse_glide_hill_paused = False
+
+  def _update_pulse_glide_hill_pause(self, sm):
+    try:
+      orientation_ned = sm["carControl"].orientationNED
+      if len(orientation_ned) < 2:
+        return self.pulse_glide_hill_paused
+      abs_pitch = abs(float(orientation_ned[1]))
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+      return self.pulse_glide_hill_paused
+
+    if not math.isfinite(abs_pitch):
+      return self.pulse_glide_hill_paused
+
+    if self.pulse_glide_hill_paused:
+      if abs_pitch <= PULSE_GLIDE_HILL_EXIT_PITCH:
+        self.pulse_glide_hill_paused = False
+    elif abs_pitch >= PULSE_GLIDE_HILL_ENTER_PITCH:
+      self.pulse_glide_hill_paused = True
+
+    return self.pulse_glide_hill_paused
+
+  def _update_pulse_glide(self, v_ego, sm, starpilot_toggles):
+    self.pulse_glide_target = None
+    pulse_glide_enabled = bool(getattr(sm["starpilotCarState"], "pulseAndGlide", False))
+    if not pulse_glide_enabled:
+      self.pulse_glide_coasting = False
+      self.pulse_glide_hill_paused = False
+      return False
+
+    if self._update_pulse_glide_hill_pause(sm):
+      self.pulse_glide_coasting = False
+      return False
+
+    raw_v_cruise_kph = 0.0 if sm["carState"].vCruise == V_CRUISE_UNSET else min(sm["carState"].vCruise, V_CRUISE_MAX)
+    if 0 < raw_v_cruise_kph < V_CRUISE_UNSET and getattr(starpilot_toggles, "set_speed_offset", 0) > 0:
+      raw_v_cruise_kph += starpilot_toggles.set_speed_offset
+    raw_v_cruise = raw_v_cruise_kph * CV.KPH_TO_MS
+    if raw_v_cruise <= 0.0:
+      self.pulse_glide_coasting = False
+      return False
+
+    effective_slc_target = get_active_slc_control_target(
+      getattr(starpilot_toggles, "speed_limit_controller", False),
+      getattr(starpilot_toggles, "set_speed_limit", False),
+      getattr(self.starpilot_planner.starpilot_vcruise, "slc_target", 0.0),
+      getattr(self.starpilot_planner.starpilot_vcruise, "slc_offset", 0.0),
+      getattr(getattr(self.starpilot_planner.starpilot_vcruise, "slc", None), "overridden_speed", 0.0),
+      max(float(getattr(sm["carState"], "vEgoCluster", v_ego) or v_ego), v_ego) - v_ego,
+      allow_lower_override=(getattr(starpilot_toggles, "redneck_cruise", False) and
+                            getattr(starpilot_toggles, "speed_limit_controller_override_set_speed", False)),
+    )
+    v_target = float(self.starpilot_planner.v_cruise or raw_v_cruise)
+    if effective_slc_target > 0.0:
+      v_target = min(v_target, effective_slc_target)
+
+    delta = max(0.0, float(getattr(starpilot_toggles, "pulse_glide_speed_delta", 0.0)))
+    lower_target = v_target - delta
+    if (delta <= 0.0 or
+        v_target <= PULSE_GLIDE_MIN_TARGET_SPEED or
+        lower_target < PULSE_GLIDE_MIN_LOWER_SPEED):
+      self.pulse_glide_coasting = False
+      return False
+
+    has_relevant_lead = any(lead_is_braking_relevant(lead, v_ego) for lead in (sm["radarState"].leadOne, sm["radarState"].leadTwo))
+    stop_context = (
+      sm["carState"].standstill or
+      getattr(sm["controlsState"], "forceDecel", False) or
+      getattr(self.starpilot_planner.starpilot_cem, "stop_light_detected", False) or
+      getattr(self.starpilot_planner.starpilot_vcruise, "forcing_stop", False) or
+      getattr(self.starpilot_planner.starpilot_following, "disable_throttle", False)
+    )
+    if has_relevant_lead or stop_context:
+      self.pulse_glide_coasting = False
+      return False
+
+    if self.pulse_glide_coasting:
+      if v_ego <= lower_target + PULSE_GLIDE_HYSTERESIS:
+        self.pulse_glide_coasting = False
+    elif v_ego >= v_target - PULSE_GLIDE_HYSTERESIS:
+      self.pulse_glide_coasting = True
+
+    if self.pulse_glide_coasting:
+      self.pulse_glide_target = lower_target
+
+    return self.pulse_glide_coasting
 
   def update(self, v_ego, sm, starpilot_toggles):
     eco_gear = sm["starpilotCarState"].ecoGear
@@ -148,6 +260,7 @@ class StarPilotAcceleration:
     truck_tuning = getattr(starpilot_toggles, "truck_tuning", False)
     custom_accel_profile = getattr(starpilot_toggles, "custom_accel_profile", False)
     custom_accel_profile_values = getattr(starpilot_toggles, "custom_accel_profile_values", [])
+    custom_accel_profile_breakpoints = getattr(starpilot_toggles, "custom_accel_profile_breakpoints", A_CRUISE_MAX_BP_CUSTOM)
     deceleration_profile = normalize_deceleration_profile(
       getattr(starpilot_toggles, "deceleration_profile", DECELERATION_PROFILES["STANDARD"])
     )
@@ -155,12 +268,25 @@ class StarPilotAcceleration:
     if sm["starpilotCarState"].trafficModeEnabled:
       self.max_accel = get_max_accel_traffic(v_ego)
     elif custom_accel_profile:
-      self.max_accel = get_max_accel_custom(v_ego, custom_accel_profile_values, starpilot_toggles.acceleration_profile, ev_tuning, truck_tuning)
-    elif starpilot_toggles.map_acceleration and (eco_gear or sport_gear):
+      self.max_accel = get_max_accel_custom(
+        v_ego,
+        custom_accel_profile_values,
+        starpilot_toggles.acceleration_profile,
+        ev_tuning,
+        truck_tuning,
+        custom_accel_profile_breakpoints,
+      )
+    elif starpilot_toggles.map_acceleration:
+      # Drive mode is authoritative while mapping is on, normal gear included. Letting
+      # normal fall through to the profile param instead leaves the car on a stale eco
+      # or sport curve for the rest of the ignition cycle once the driver selects it
+      # again, because the param resync below cannot be observed any sooner.
       if eco_gear:
         self.max_accel = get_max_accel_eco(v_ego, ev_tuning, truck_tuning)
-      else:
+      elif sport_gear:
         self.max_accel = get_max_allowed_accel(v_ego, ev_tuning, truck_tuning)
+      else:
+        self.max_accel = get_max_accel_standard(v_ego, ev_tuning, truck_tuning)
     else:
       if starpilot_toggles.acceleration_profile == ACCELERATION_PROFILES["ECO"]:
         self.max_accel = get_max_accel_eco(v_ego, ev_tuning, truck_tuning)
@@ -174,8 +300,11 @@ class StarPilotAcceleration:
     if self.starpilot_planner.starpilot_weather.weather_id != 0:
       self.max_accel -= self.max_accel * self.starpilot_planner.starpilot_weather.reduce_acceleration
 
+    pulse_glide_coasting = self._update_pulse_glide(v_ego, sm, starpilot_toggles)
     if sm["starpilotCarState"].forceCoast:
       self.min_accel = A_CRUISE_MIN_ECO
+    elif pulse_glide_coasting:
+      self.min_accel = PULSE_GLIDE_COAST_MIN_ACCEL
     elif sm["starpilotCarState"].trafficModeEnabled:
       self.min_accel = A_CRUISE_MIN_TRAFFIC
     elif starpilot_toggles.map_deceleration and (eco_gear or sport_gear):
@@ -184,6 +313,10 @@ class StarPilotAcceleration:
       else:
         self.min_accel = A_CRUISE_MIN_SPORT
     else:
+      if starpilot_toggles.map_deceleration:
+        # Same reasoning as the acceleration side, but resolved through the profile so
+        # normal gear keeps the SLC-shaped floor below.
+        deceleration_profile = DECELERATION_PROFILES["STANDARD"]
       self.min_accel = get_profile_min_accel_floor(deceleration_profile)
 
       raw_v_cruise_kph = 0.0 if sm["carState"].vCruise == V_CRUISE_UNSET else min(sm["carState"].vCruise, V_CRUISE_MAX)
@@ -203,6 +336,8 @@ class StarPilotAcceleration:
         getattr(self.starpilot_planner.starpilot_vcruise, "slc_offset", 0.0),
         getattr(getattr(self.starpilot_planner.starpilot_vcruise, "slc", None), "overridden_speed", 0.0),
         v_ego_diff,
+        allow_lower_override=(getattr(starpilot_toggles, "redneck_cruise", False) and
+                              getattr(starpilot_toggles, "speed_limit_controller_override_set_speed", False)),
       )
       v_target = float(self.starpilot_planner.v_cruise or raw_v_cruise)
       if effective_slc_target > 0.0:
@@ -227,20 +362,18 @@ class StarPilotAcceleration:
     # Sync AccelerationProfile and DecelerationProfile params so the UI reflects the active drive mode
     # Eco → Eco, Normal → Standard, Sport → Sport+
     gear_state = "eco" if eco_gear else ("sport" if sport_gear else "normal")
-    if gear_state != self.last_gear_state:
+    mapping_enabled = starpilot_toggles.map_acceleration or starpilot_toggles.map_deceleration
+    # Latch only once a mapping is actually enabled. Consuming the transition while both
+    # toggles are still off would skip the resync for the life of the process, since gear
+    # state never changes again on a drive that stays in one mode.
+    if gear_state != self.last_gear_state and mapping_enabled:
       self.last_gear_state = gear_state
-      if gear_state == "eco":
-        if starpilot_toggles.map_acceleration:
-          self.params.put_nonblocking("AccelerationProfile", ACCELERATION_PROFILES["ECO"])
-        if starpilot_toggles.map_deceleration:
-          self.params.put_nonblocking("DecelerationProfile", DECELERATION_PROFILES["ECO"])
-      elif gear_state == "sport":
-        if starpilot_toggles.map_acceleration:
-          self.params.put_nonblocking("AccelerationProfile", ACCELERATION_PROFILES["SPORT_PLUS"])
-        if starpilot_toggles.map_deceleration:
-          self.params.put_nonblocking("DecelerationProfile", DECELERATION_PROFILES["SPORT"])
-      else:
-        if starpilot_toggles.map_acceleration:
-          self.params.put_nonblocking("AccelerationProfile", ACCELERATION_PROFILES["STANDARD"])
-        if starpilot_toggles.map_deceleration:
-          self.params.put_nonblocking("DecelerationProfile", DECELERATION_PROFILES["STANDARD"])
+      mapped_acceleration_profile, mapped_deceleration_profile = GEAR_STATE_PROFILES[gear_state]
+      if starpilot_toggles.map_acceleration:
+        self.params.put_nonblocking("AccelerationProfile", mapped_acceleration_profile)
+      if starpilot_toggles.map_deceleration:
+        self.params.put_nonblocking("DecelerationProfile", mapped_deceleration_profile)
+      # The planner reads the toggles blob rather than these params, and that blob is only
+      # rebuilt when this flag is set. Without it the write stays invisible until the next
+      # ignition cycle and the UI disagrees with what the planner is actually running.
+      self.params_memory.put_bool("StarPilotTogglesUpdated", True)

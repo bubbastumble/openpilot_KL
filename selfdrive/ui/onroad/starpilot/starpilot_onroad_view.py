@@ -1,27 +1,36 @@
 import pyray as rl
-import time
 from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui.onroad.augmented_road_view import AugmentedRoadView
 from openpilot.selfdrive.ui.onroad.starpilot.starpilot_border import render_behind, render_overlay, render_background_effects
 from openpilot.selfdrive.ui.onroad.starpilot.path import render_adjacent_lanes, render_path_edges
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.onroad.starpilot.torque_bar import TorqueBar
+from openpilot.selfdrive.ui.onroad.starpilot.rivian_lateral_mode import rivian_lateral_mode
 from openpilot.selfdrive.ui.onroad.starpilot.widget_layout_manager import WidgetLayoutManager
 from openpilot.selfdrive.ui.onroad.starpilot.widgets import (
   SetSpeedWidget, SpeedLimitWidget, PedalIconsWidget,
   AetherGaugeWidget, PersonalityButtonWidget, DriverMonitorWidget,
-  SteeringWheelWidget
+  SteeringWheelWidget, StoppedTimerWidget, ModelSourceWidget
 )
 from openpilot.selfdrive.ui.onroad.starpilot.stopping_point import render_stopping_point
 from openpilot.selfdrive.ui.onroad.starpilot.pause_indicators import render_lateral_paused, render_longitudinal_paused
+from openpilot.selfdrive.ui.onroad.starpilot.pulse_glide import get_pulse_glide_border_color, render_pulse_glide
+from openpilot.selfdrive.ui.onroad.starpilot.pip_sidecam import PipSideCamera
+from openpilot.selfdrive.ui.onroad.starpilot.favorite_radial_menu import FavoriteRadialMenu
 from openpilot.selfdrive.ui.onroad.starpilot.weather_icon import render_weather_icon
 from openpilot.selfdrive.ui.lib.starpilot_status import (
-  get_screen_edge_color, ENGAGED_COLOR,
-  EXPERIMENTAL_COLOR, TRAFFIC_COLOR,
+  get_screen_edge_color,
+)
+from openpilot.selfdrive.ui.lib.starpilot_visuals import get_border_roundness
+from openpilot.starpilot.common.favorite_slots import (
+  build_favorite_slot_options,
+  filter_favorite_slot_options,
+  favorite_key_is_valid,
+  is_bool_param,
 )
 
 from openpilot.system.ui.lib.application import MousePos, gui_app, FontWeight
-from openpilot.system.ui.lib.text_measure import measure_text_cached
+from openpilot.system.ui.lib.text_measure import draw_text_with_shadow, measure_text_cached
 
 from cereal import log
 AlertSize = log.SelfdriveState.AlertSize
@@ -30,15 +39,22 @@ AlertSize = log.SelfdriveState.AlertSize
 class StarPilotOnroadView(AugmentedRoadView):
   def __init__(self, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_ROAD):
     super().__init__(stream_type)
-    self._params = ui_state.params
+    self._params = ui_state.ui_params
 
     self._font_bold = gui_app.font(FontWeight.BOLD)
     self._font_medium = gui_app.font(FontWeight.MEDIUM)
-    self._standstill_started_at = 0.0
     self._torque_bar = TorqueBar()
     self._min_fps = 99.9
     self._max_fps = 0.0
     self._avg_fps = 0.0
+
+    self._pip_sidecam = self._child(PipSideCamera())
+    self._favorite_radial_menu = FavoriteRadialMenu(
+      ui_state.ui_params,
+      ui_state.params_memory,
+      self._favorite_slot_options,
+    )
+    self._favorite_input_consumed = False
 
     self.layout_manager = WidgetLayoutManager(self._content_rect)
 
@@ -55,6 +71,8 @@ class StarPilotOnroadView(AugmentedRoadView):
     self._pedals_widget = PedalIconsWidget()
     self._personality_button_widget = PersonalityButtonWidget()
     self._driver_monitor_widget = DriverMonitorWidget(self.driver_state_renderer)
+    self._model_source_widget = ModelSourceWidget()
+    self._stopped_timer_widget = StoppedTimerWidget(self.is_in_reverse)
 
     # Register to layout zones
     self.layout_manager.register_widget("left", self._set_speed_widget)
@@ -62,6 +80,7 @@ class StarPilotOnroadView(AugmentedRoadView):
     self.layout_manager.register_widget("left", self._aethergauge_widget)
     self.layout_manager.register_widget("right", self._steering_wheel_widget)
     self.layout_manager.register_widget("right", self._pedals_widget)
+    self.layout_manager.register_widget("right_center", self._model_source_widget)
     self.layout_manager.register_widget("bottom", self._personality_button_widget)
     self.layout_manager.register_widget("bottom", self._driver_monitor_widget)
 
@@ -73,37 +92,83 @@ class StarPilotOnroadView(AugmentedRoadView):
     self._child(self._pedals_widget)
     self._child(self._personality_button_widget)
     self._child(self._driver_monitor_widget)
+    self._child(self._model_source_widget)
+    self._child(self._stopped_timer_widget)
+
+  def _update_state(self) -> None:
+    rivian_lateral_mode.update()
+    self._hud_renderer._exp_button.wheel_tint = rivian_lateral_mode.wheel_tint
 
   def _render(self, rect: rl.Rectangle):
     border_width = self._get_border_width()
-    border_color = get_screen_edge_color(ui_state)
-    rl.draw_rectangle_rounded(rect, 0.12, 10, border_color)
+    border_roundness = get_border_roundness(rect, border_width)
+    border_color = get_pulse_glide_border_color(ui_state.sm, get_screen_edge_color(ui_state))
+    rl.draw_rectangle_rounded(rect, border_roundness, 10, border_color)
     render_background_effects(rect, border_width)
-    super()._render(rect)
 
-    if not ui_state.started:
-      return
+    # The favorite menu has first claim on the lower-left gesture. Filtering
+    # its events before the inherited HUD/widgets render prevents a corner tap
+    # from also activating a background on-road control.
+    original_events = list(gui_app.mouse_events)
+    self._favorite_input_consumed = False
+    if ui_state.started:
+      anticipated_content_rect = rl.Rectangle(
+        rect.x + border_width,
+        rect.y + border_width,
+        rect.width - 2 * border_width,
+        rect.height - 2 * border_width,
+      )
+      self._favorite_input_consumed = self._favorite_radial_menu.process_mouse_events(
+        original_events, anticipated_content_rect,
+      )
+      if self._favorite_input_consumed:
+        gui_app.mouse_events[:] = []
 
-    if self._draw_hud_controls:
-      dm = self.driver_state_renderer
-      self.layout_manager.update_layout(self._content_rect, is_rhd=dm.is_rhd if dm else False)
-      self._render_slc()
-      self._render_overlays()
-      self._render_road_name()
-    if self._draw_road_overlays:
-      self._render_path_features(self._content_rect)
+    try:
+      self._hud_renderer.draw_current_speed = (
+        ui_state.started and not self._stopped_timer_widget.replaces_current_speed
+      )
+      super()._render(rect)
+
+      if not ui_state.started:
+        self._favorite_radial_menu.collapse()
+        return
+
+      if self._draw_hud_controls:
+        dm = self.driver_state_renderer
+        self.layout_manager.update_layout(self._content_rect, is_rhd=dm.is_rhd if dm else False)
+        self._render_slc()
+        self._render_overlays()
+        self._render_road_name()
+
+      self._pip_sidecam.render(self._content_rect)
+
+      # The picker is an app-drawer modal, so it intentionally draws above
+      # PiP and other on-road overlays while active.
+      if self._draw_hud_controls and not self._full_alert_showing():
+        rl.begin_scissor_mode(
+          int(round(self._content_rect.x)), int(round(self._content_rect.y)),
+          int(round(self._content_rect.width)), int(round(self._content_rect.height)),
+        )
+        try:
+          self._favorite_radial_menu.render(self._content_rect)
+        finally:
+          rl.end_scissor_mode()
+      else:
+        self._favorite_radial_menu.collapse()
+    finally:
+      gui_app.mouse_events[:] = original_events
 
   def _draw_border(self, rect: rl.Rectangle):
     border_width = self._get_border_width()
-    rl.draw_rectangle_rounded_lines_ex(rect, 0.12, 10, border_width, rl.BLACK)
+    border_roundness = get_border_roundness(rect, border_width)
+    rl.draw_rectangle_rounded_lines_ex(rect, border_roundness, 10, border_width, rl.BLACK)
     border_rect = rl.Rectangle(rect.x + border_width, rect.y + border_width,
                                 rect.width - 2 * border_width, rect.height - 2 * border_width)
-    render_behind(border_rect, border_width)
     render_overlay(border_rect, border_width)
 
   def _render_slc(self):
-    alert_showing, alert_size = self.alert_renderer.will_render()
-    if alert_showing is not None and alert_size == AlertSize.full:
+    if self._full_alert_showing():
       return
     if self._speed_limit_widget.is_visible:
       self._speed_limit_widget.render(self._speed_limit_widget.rect)
@@ -112,10 +177,13 @@ class StarPilotOnroadView(AugmentedRoadView):
 
   def _render_overlays(self):
     alert_showing, _ = self.alert_renderer.will_render()
+    if alert_showing is not None and alert_showing.size == AlertSize.full:
+      return
+
+    self._stopped_timer_widget.render(self._content_rect)
     if alert_showing is not None:
       return
 
-    self._render_standstill_timer()
     self._render_developer_metrics()
 
     self.layout_manager.render_widgets(exclude={"speed_limit", "set_speed"})
@@ -127,112 +195,61 @@ class StarPilotOnroadView(AugmentedRoadView):
     """Draw the curved torque-utilization indicator at the bottom of the screen."""
     if not self._params.get_bool("EnableTorqueBarWidget", default=True):
       return
-    if ui_state.sm['controlsState'].lateralControlState.which() == 'angleState':
-      return
     rl.begin_scissor_mode(
-      int(self._content_rect.x), int(self._content_rect.y),
-      int(self._content_rect.width), int(self._content_rect.height),
+      int(round(self._content_rect.x)), int(round(self._content_rect.y)),
+      int(round(self._content_rect.width)), int(round(self._content_rect.height)),
     )
     self._torque_bar.render(self._content_rect)
     rl.end_scissor_mode()
 
-  def _render_path_features(self, rect: rl.Rectangle):
-    """Render path-related features (adjacent paths, blind spot, path edges)."""
+  def _render_extra_road_overlays(self, rect: rl.Rectangle) -> None:
+    """Render path features in the parent's clipped road-overlay layer."""
     mr = self.model_renderer
 
-    # Only render if we have path data
-    if not mr._path.projected_points.size:
-      return
+    if mr._path.projected_points.size:
+      # Path edges (always rendered if track_edge_vertices exist)
+      if mr._track_edge_vertices.size >= 4:
+        render_path_edges(mr)
 
-    rl.begin_scissor_mode(
-      int(rect.x), int(rect.y),
-      int(rect.width), int(rect.height),
-    )
+      # Render adjacent lanes (incorporates both adjacent path and blind spot warnings)
+      render_adjacent_lanes(mr)
 
-    # Path edges (always rendered if track_edge_vertices exist)
-    if mr._track_edge_vertices.size >= 4:
-      render_path_edges(mr)
+      # Render stopping point atop the path
+      render_stopping_point(mr, self._font_bold)
 
-    # Render adjacent lanes (incorporates both adjacent path and blind spot warnings)
-    render_adjacent_lanes(mr)
+    # Keep the CSC glow above the camera/model/path layers, but below the HUD.
+    render_behind(rect, self._get_border_width())
 
-    # Render stopping point atop the path
-    render_stopping_point(mr, self._font_bold)
-
-    rl.end_scissor_mode()
-
-  def _render_standstill_timer(self):
-    if not self._params.get_bool("stopped_timer"):
-      self._standstill_started_at = 0.0
-      return
-    if not ui_state.sm.valid.get("carState", False):
-      return
-
-    car_state = ui_state.sm["carState"]
-    if getattr(car_state, "standstill", False):
-      if self._standstill_started_at == 0.0:
-        self._standstill_started_at = time.monotonic()
-    else:
-      self._standstill_started_at = 0.0
-      return
-
-    if self._standstill_started_at == 0.0:
-      return
-
-    duration = int(time.monotonic() - self._standstill_started_at)
-    if duration < 60:
-      return
-
-    minutes = duration // 60
-    seconds = duration % 60
-    minute_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
-    second_text = f"{seconds} second{'s' if seconds != 1 else ''}"
-    minute_size = measure_text_cached(self._font_bold, minute_text, 176)
-    second_size = measure_text_cached(self._font_medium, second_text, 66)
-
-    def blend_colors(start: rl.Color, end: rl.Color, transition: float) -> rl.Color:
-      transition = float(min(max(transition, 0.0), 1.0))
-      return rl.Color(
-        int(start.r + transition * (end.r - start.r)),
-        int(start.g + transition * (end.g - start.g)),
-        int(start.b + transition * (end.b - start.b)),
-        255,
-      )
-
-    if duration < 150:
-      transition = (duration - 60) / 90.0
-      duration_color = blend_colors(ENGAGED_COLOR, EXPERIMENTAL_COLOR, transition)
-    elif duration < 300:
-      transition = (duration - 150) / 150.0
-      duration_color = blend_colors(EXPERIMENTAL_COLOR, TRAFFIC_COLOR, transition)
-    else:
-      duration_color = TRAFFIC_COLOR
-
-    x = gui_app.width / 2
-    rl.draw_text_ex(
-      self._font_bold,
-      minute_text,
-      rl.Vector2(x - minute_size.x / 2, 210 - minute_size.y / 2),
-      176,
-      0,
-      duration_color,
-    )
-    rl.draw_text_ex(
-      self._font_medium,
-      second_text,
-      rl.Vector2(x - second_size.x / 2, 290 - second_size.y / 2),
-      66,
-      0,
-      rl.Color(255, 255, 255, 242),
-    )
+  def _full_alert_showing(self) -> bool:
+    alert_showing, _ = self.alert_renderer.will_render()
+    return alert_showing is not None and alert_showing.size == AlertSize.full
 
   def _handle_mouse_press(self, mouse_pos: MousePos):
+    if self._favorite_input_consumed or self._favorite_radial_menu.blocks_pointer(mouse_pos):
+      return
+
     # Check if click maps to any of the layout widgets
     for zone in self.layout_manager.zones.values():
       for widget in zone:
-        if widget.is_visible and rl.check_collision_point_rec(mouse_pos, widget.rect):
+        if widget.is_visible and widget.blocks_pointer and rl.check_collision_point_rec(mouse_pos, widget.rect):
           return
     super()._handle_mouse_press(mouse_pos)
+
+  def _favorite_slot_options(self):
+    cp = ui_state.CP
+    return filter_favorite_slot_options(
+      build_favorite_slot_options(
+        lambda key: favorite_key_is_valid(self._params, key),
+        alpha_longitudinal_available=bool(getattr(cp, "alphaLongitudinalAvailable", False)),
+      ),
+      {
+        # This matches Galaxy's capability gate without importing its web
+        # server (or duplicating its option metadata) into the on-road UI.
+        "HasRivianAngleHarness": (
+          getattr(cp, "brand", "") == "rivian" and bool(int(getattr(cp, "flags", 0)) & (1 << 0))
+        ),
+      },
+    )
 
   def _render_developer_metrics(self):
     toggles = ui_state.starpilot_toggles
@@ -332,6 +349,7 @@ class StarPilotOnroadView(AugmentedRoadView):
 
     # Check pause/CEM states
     starpilot_car_state = ui_state.sm["starpilotCarState"] if ui_state.sm.valid.get("starpilotCarState", False) else None
+    plan = ui_state.sm["starpilotPlan"] if ui_state.sm.valid.get("starpilotPlan", False) else None
     lateral_paused = starpilot_car_state.pauseLateral if starpilot_car_state else False
     longitudinal_paused = (starpilot_car_state.pauseLongitudinal or starpilot_car_state.forceCoast) if starpilot_car_state else False
 
@@ -342,6 +360,8 @@ class StarPilotOnroadView(AugmentedRoadView):
       active_badges.append("lateral_paused")
     if longitudinal_paused:
       active_badges.append("longitudinal_paused")
+    if starpilot_car_state and starpilot_car_state.pulseAndGlide:
+      active_badges.append("pulse_glide")
 
     # Dimensions
     badge_w = 120
@@ -367,9 +387,11 @@ class StarPilotOnroadView(AugmentedRoadView):
         render_lateral_paused(badge_rect)
       elif badge == "longitudinal_paused":
         render_longitudinal_paused(badge_rect)
+      elif badge == "pulse_glide":
+        pulse_glide_coasting = bool(getattr(plan, "pulseGlideCoasting", False)) if plan else False
+        render_pulse_glide(badge_rect, pulse_glide_coasting)
 
     # 2. Render Weather (on the opposite side of DM icon)
-    plan = ui_state.sm["starpilotPlan"] if ui_state.sm.valid.get("starpilotPlan", False) else None
     if plan and plan.weatherId != 0:
       weather_w = 120
       weather_h = 120
@@ -385,6 +407,9 @@ class StarPilotOnroadView(AugmentedRoadView):
       render_weather_icon(weather_rect)
 
   def _render_road_name(self):
+    if self._full_alert_showing():
+      return
+
     toggles = ui_state.starpilot_toggles
     road_name_on = bool(toggles.get("road_name_ui", self._params.get_bool("RoadNameUI")))
     if not road_name_on:
@@ -398,18 +423,12 @@ class StarPilotOnroadView(AugmentedRoadView):
       return
 
     font = self._font_bold
-    font_size = 32
+    font_size = 40
     sz = measure_text_cached(font, road_name, font_size)
 
-    pad_x = 24
-    pad_y = 5
-    pill_w = sz.x + pad_x * 2
-    pill_h = font_size + pad_y * 2
-
     cx = self._content_rect.x + self._content_rect.width / 2
-    by = self._content_rect.y + self._content_rect.height - pill_h - 16
-
-    pill = rl.Rectangle(cx - pill_w / 2, by, pill_w, pill_h)
-    rl.draw_rectangle_rounded(pill, 0.4, 8, rl.Color(0, 0, 0, 166))
-    rl.draw_rectangle_rounded_lines_ex(pill, 0.4, 8, 1, rl.Color(255, 255, 255, 60))
-    rl.draw_text_ex(font, road_name, rl.Vector2(cx - sz.x / 2, by + pad_y), font_size, 0, rl.WHITE)
+    text_pos = rl.Vector2(
+      round(cx - sz.x / 2),
+      round(self._content_rect.y + self._content_rect.height - sz.y - 5),
+    )
+    draw_text_with_shadow(font, road_name, text_pos, font_size, rl.WHITE)

@@ -160,6 +160,8 @@ class MiciHomeLayout(Widget):
     self._current_model_name = "default"
 
     self._mode_status_atom = ModeStatusAtom()
+    self._bluetooth_icon = IconWidget("icons_mici/settings/bluetooth.png", (38, 38), opacity=0.9)
+    self._bluetooth_icon.set_visible(False)
     self._egpu_icon = IconWidget("icons_mici/egpu.png", (50, 37))
     self._egpu_icon_gray = IconWidget("icons_mici/egpu_gray.png", (50, 37))
     self._mic_icon = IconWidget("icons_mici/microphone.png", (32, 46))
@@ -167,13 +169,14 @@ class MiciHomeLayout(Widget):
     self._status_bar_layout = HBoxLayout([
       IconWidget("icons_mici/settings.png", (48, 48), opacity=0.9),
       NetworkIcon(),
+      self._bluetooth_icon,
       self._mode_status_atom,
       self._egpu_icon,
       self._egpu_icon_gray,
       self._mic_icon,
     ], spacing=18)
 
-    self._openpilot_label = UnifiedLabel("starpilot", font_size=96, font_weight=FontWeight.DISPLAY, max_width=480, wrap_text=False)
+    self._openpilot_label = UnifiedLabel("StarPilot", font_size=96, font_weight=FontWeight.BRAND, max_width=480, wrap_text=False)
     self._version_label = UnifiedLabel("", font_size=36, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
     self._large_version_label = UnifiedLabel("", font_size=64, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
     self._date_label = UnifiedLabel("", font_size=36, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
@@ -187,6 +190,7 @@ class MiciHomeLayout(Widget):
 
   def _update_params(self):
     self._experimental_mode = ui_state.params.get_bool("ExperimentalMode")
+    self._bluetooth_icon.set_visible(ui_state.params.get_bool("BluetoothEnabled"))
     self._mode_status_atom.refresh()
 
     def _clean_model_name(value: str) -> str:
@@ -213,8 +217,8 @@ class MiciHomeLayout(Widget):
 
     if self._mouse_down_t is not None:
       if time.monotonic() - self._mouse_down_t > 0.5:
-        # long gating for experimental mode - only allow toggle if longitudinal control is available
-        if ui_state.has_longitudinal_control:
+        # Only allow the toggle when this vehicle exposes Experimental Mode.
+        if ui_state.experimental_mode_available:
           self._experimental_mode = not self._experimental_mode
           ui_state.params.put("ExperimentalMode", self._experimental_mode)
           self._mode_status_atom.refresh()

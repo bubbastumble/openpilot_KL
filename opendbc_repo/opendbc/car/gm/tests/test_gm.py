@@ -20,6 +20,7 @@ from opendbc.car.gm.carcontroller import (
 )
 import opendbc.car.gm.interface as gm_interface
 from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.gps import CHEVROLET_BOLT_GPS_CARS, CHEVROLET_BOLT_GPS_MESSAGES, get_car_gps_config, parse_chevrolet_bolt_can_gps
 from opendbc.car.gm.fingerprints import FINGERPRINTS
 from opendbc.car.gm.values import ASCM_INT, CAMERA_ACC_CAR, CAR, CC_ONLY_CAR, DBC, GM_RX_OFFSET, CarControllerParams, CruiseButtons, GMFlags, GMSafetyFlags
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
@@ -63,6 +64,43 @@ class TestGMFingerprint:
       for finger in fingerprints:
         for required_addr in (CAMERA_DIAGNOSTIC_ADDRESS, CAMERA_DIAGNOSTIC_ADDRESS + GM_RX_OFFSET):
           assert finger.get(required_addr) == 8, required_addr
+
+
+class TestBoltGps:
+  @parameterized.expand(CHEVROLET_BOLT_GPS_CARS)
+  def test_all_bolt_generations_are_registered(self, car_model):
+    config = get_car_gps_config(SimpleNamespace(carFingerprint=car_model, brand="gm"))
+    assert config is not None
+    assert config.messages == CHEVROLET_BOLT_GPS_MESSAGES
+    gps = parse_chevrolet_bolt_can_gps({
+      "GPSLatitude": 145292743.0,
+      "GPSLongitude": -267520892.0,
+    })
+    assert gps is not None
+    assert gps["hasFix"]
+    assert gps["latitude"] == pytest.approx(40.3590953)
+    assert gps["longitude"] == pytest.approx(-74.3113589)
+
+  def test_invalid_bolt_position_does_not_become_a_fix(self):
+    gps = parse_chevrolet_bolt_can_gps({"GPSLatitude": 0.0, "GPSLongitude": -2147483648.0})
+    assert gps is not None
+    assert not gps["hasFix"]
+    assert gps["latitude"] == 0.0
+    assert gps["longitude"] == 0.0
+
+  @parameterized.expand(CHEVROLET_BOLT_GPS_CARS)
+  def test_gps_message_is_added_to_powertrain_parser(self, car_model):
+    cp = SimpleNamespace(
+      brand="gm",
+      carFingerprint=car_model,
+      flags=0,
+      networkLocation=structs.CarParams.NetworkLocation.gateway,
+      transmissionType=structs.CarParams.TransmissionType.direct,
+      enableBsm=False,
+      enableGasInterceptorDEPRECATED=False,
+    )
+    parsers = GMCarState.get_can_parsers(cp)
+    assert all(message in parsers[Bus.pt].vl for message in CHEVROLET_BOLT_GPS_MESSAGES)
 
 
 class TestGMInterface:
@@ -201,6 +239,45 @@ class TestGMInterface:
     assert car_params.flags & GMFlags.NO_CAMERA.value
     assert car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.FLAG_GM_NO_CAMERA.value
 
+  def test_volt_cc_obd_gateway_uses_cc_long_no_camera_path(self):
+    CarInterface = interfaces[CAR.CHEVROLET_VOLT_CC]
+    car_params = CarInterface.get_params(
+      CAR.CHEVROLET_VOLT_CC,
+      _empty_fingerprint(),
+      [],
+      alpha_long=False,
+      is_release=False,
+      docs=False,
+      starpilot_toggles=_test_starpilot_toggles(),
+    )
+
+    assert car_params.networkLocation == structs.CarParams.NetworkLocation.gateway
+    assert car_params.flags & GMFlags.CC_LONG.value
+    assert car_params.flags & GMFlags.NO_CAMERA.value
+    assert not (car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.HW_CAM.value)
+    assert car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.FLAG_GM_CC_LONG.value
+    assert car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.FLAG_GM_NO_ACC.value
+    assert car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.FLAG_GM_NO_CAMERA.value
+
+    parsers = CarInterface.CarState.get_can_parsers(car_params)
+    assert "ECMCruiseControl" in parsers[Bus.pt].vl
+    assert not parsers[Bus.cam].vl
+
+  def test_other_cc_only_gateway_does_not_use_volt_cc_safety_path(self):
+    CarInterface = interfaces[CAR.CHEVROLET_SILVERADO_CC]
+    car_params = CarInterface.get_params(
+      CAR.CHEVROLET_SILVERADO_CC,
+      _empty_fingerprint(),
+      [],
+      alpha_long=False,
+      is_release=False,
+      docs=False,
+      starpilot_toggles=_test_starpilot_toggles(),
+    )
+
+    assert car_params.networkLocation == structs.CarParams.NetworkLocation.gateway
+    assert not (car_params.safetyConfigs[0].safetyParam & GMSafetyFlags.FLAG_GM_VOLT_CC_GATEWAY.value)
+
   def test_volt_ascm_sparse_fingerprint_without_camera_does_not_set_no_camera(self):
     CarInterface = interfaces[CAR.CHEVROLET_VOLT_ASCM]
     fingerprint = {
@@ -226,10 +303,35 @@ class TestGMInterface:
 
     assert car_params.openpilotLongitudinalControl
     assert not car_params.enableGasInterceptorDEPRECATED
+    assert car_params.minEnableSpeed == pytest.approx(0.0)
     assert list(car_params.longitudinalTuning.kpBP) == pytest.approx([0.0, 5.0, 15.0, 35.0])
     assert list(car_params.longitudinalTuning.kpV) == pytest.approx([0.02, 0.03, 0.028, 0.022])
     assert list(car_params.longitudinalTuning.kiBP) == pytest.approx([0.0, 5.0, 15.0, 35.0])
     assert list(car_params.longitudinalTuning.kiV) == pytest.approx([0.20, 0.18, 0.13, 0.08])
+
+  def test_silverado_camera_acc_allows_engage_from_stop(self):
+    CarInterface = interfaces[CAR.CHEVROLET_SILVERADO]
+    fingerprint = _empty_fingerprint()
+    fingerprint[0] = FINGERPRINTS[CAR.CHEVROLET_SILVERADO][0].copy()
+
+    car_params = CarInterface.get_params(CAR.CHEVROLET_SILVERADO, fingerprint, [], alpha_long=False, is_release=False,
+                                         docs=False, starpilot_toggles=_test_starpilot_toggles())
+
+    assert car_params.minEnableSpeed == pytest.approx(0.0)
+
+  def test_silverado_cc_allows_engage_from_stop(self):
+    CarInterface = interfaces[CAR.CHEVROLET_SILVERADO_CC]
+    car_params = CarInterface.get_params(
+      CAR.CHEVROLET_SILVERADO_CC,
+      _empty_fingerprint(),
+      [],
+      alpha_long=False,
+      is_release=False,
+      docs=False,
+      starpilot_toggles=_test_starpilot_toggles(),
+    )
+
+    assert car_params.minEnableSpeed == pytest.approx(0.0)
 
   def test_blazer_uses_softer_low_speed_stop_hold_tune(self):
     CarInterface = interfaces[CAR.CHEVROLET_BLAZER]
@@ -526,6 +628,13 @@ class TestGMCarController:
     assert not should_send_cc_button_spam(SimpleNamespace(flags=GMFlags.CC_LONG.value, minEnableSpeed=10.0), cc, cs)
     assert not should_send_cc_button_spam(SimpleNamespace(flags=0, minEnableSpeed=10.0), cc, cs)
 
+  def test_cc_button_spam_allows_standstill_when_min_enable_is_zero(self):
+    cp = SimpleNamespace(flags=GMFlags.CC_LONG.value, minEnableSpeed=0.0)
+    cc = SimpleNamespace(longActive=True)
+    cs = SimpleNamespace(out=SimpleNamespace(vEgo=0.0, cruiseState=SimpleNamespace(enabled=False)))
+
+    assert should_send_cc_button_spam(cp, cc, cs)
+
   def test_volt_cc_redneck_spam_is_mirrored_to_camera_bus(self):
     packer = CANPacker(DBC[CAR.CHEVROLET_VOLT_CC][Bus.pt])
     controller = SimpleNamespace(frame=int(0.3 / DT_CTRL), last_button_frame=0, apply_speed=0, malibu_button_phase=0)
@@ -533,6 +642,7 @@ class TestGMCarController:
       CP=SimpleNamespace(
         carFingerprint=CAR.CHEVROLET_VOLT_CC,
         flags=0,
+        networkLocation=structs.CarParams.NetworkLocation.fwdCamera,
         minEnableSpeed=24 * CV.MPH_TO_MS,
       ),
       buttons_counter=2,
@@ -554,6 +664,7 @@ class TestGMCarController:
       CP=SimpleNamespace(
         carFingerprint=CAR.CHEVROLET_VOLT_CC,
         flags=GMFlags.NO_CAMERA.value,
+        networkLocation=structs.CarParams.NetworkLocation.gateway,
         minEnableSpeed=24 * CV.MPH_TO_MS,
       ),
       buttons_counter=2,
@@ -588,6 +699,80 @@ class TestGMCarController:
     msgs = gmcan.create_gm_cc_spam_command(packer, controller, cs, actuators, SimpleNamespace(is_metric=False))
 
     assert [msg[2] for msg in msgs] == [0]
+
+  @parameterized.expand([
+    CAR.CHEVROLET_BOLT_CC_2017,
+    CAR.CHEVROLET_BOLT_CC_2018_2021,
+    CAR.CHEVROLET_BOLT_CC_2022_2023,
+  ])
+  def test_bolt_cc_redneck_ignores_small_setpoint_error(self, car_model):
+    packer = CANPacker(DBC[car_model][Bus.pt])
+    controller = SimpleNamespace(frame=int(2.0 / DT_CTRL), last_button_frame=0, apply_speed=0)
+    cs = SimpleNamespace(
+      CP=SimpleNamespace(
+        carFingerprint=car_model,
+        minEnableSpeed=24 * CV.MPH_TO_MS,
+      ),
+      buttons_counter=2,
+      out=SimpleNamespace(
+        vEgo=(60.6 * CV.MPH_TO_MS) / 1.01,
+        cruiseState=SimpleNamespace(speed=60 * CV.MPH_TO_MS),
+      ),
+    )
+
+    msgs = gmcan.create_gm_cc_spam_command(packer, controller, cs, SimpleNamespace(accel=0.0), SimpleNamespace(is_metric=False))
+
+    assert msgs == []
+    assert controller.apply_speed == 60
+
+  def test_non_bolt_cc_redneck_keeps_existing_setpoint_selector(self):
+    packer = CANPacker(DBC[CAR.CHEVROLET_EQUINOX_CC][Bus.pt])
+    controller = SimpleNamespace(frame=int(2.0 / DT_CTRL), last_button_frame=0, apply_speed=0)
+    cs = SimpleNamespace(
+      CP=SimpleNamespace(
+        carFingerprint=CAR.CHEVROLET_EQUINOX_CC,
+        flags=GMFlags.CC_LONG.value,
+        minEnableSpeed=24 * CV.MPH_TO_MS,
+      ),
+      buttons_counter=2,
+      out=SimpleNamespace(
+        vEgo=(60.6 * CV.MPH_TO_MS) / 1.01,
+        cruiseState=SimpleNamespace(speed=60 * CV.MPH_TO_MS),
+      ),
+    )
+
+    msgs = gmcan.create_gm_cc_spam_command(packer, controller, cs, SimpleNamespace(accel=0.0), SimpleNamespace(is_metric=False))
+
+    assert len(msgs) == 1
+    assert controller.apply_speed == 61
+
+  def test_bolt_cc_redneck_requires_persistent_acceleration_after_deceleration(self):
+    cp = SimpleNamespace(carFingerprint=CAR.CHEVROLET_BOLT_CC_2018_2021)
+    controller = SimpleNamespace(
+      frame=100,
+      gm_cc_last_direction_button=CruiseButtons.DECEL_SET,
+      gm_cc_last_direction_frame=100,
+      gm_cc_pending_reverse_button=CruiseButtons.INIT,
+      gm_cc_pending_reverse_frame=0,
+    )
+
+    assert gmcan.stabilize_bolt_cc_button(controller, cp, CruiseButtons.RES_ACCEL) == CruiseButtons.INIT
+    controller.frame += int(0.5 / DT_CTRL)
+    assert gmcan.stabilize_bolt_cc_button(controller, cp, CruiseButtons.RES_ACCEL) == CruiseButtons.INIT
+    controller.frame += int(0.11 / DT_CTRL)
+    assert gmcan.stabilize_bolt_cc_button(controller, cp, CruiseButtons.RES_ACCEL) == CruiseButtons.RES_ACCEL
+
+  def test_bolt_cc_redneck_deceleration_is_not_debounced(self):
+    cp = SimpleNamespace(carFingerprint=CAR.CHEVROLET_BOLT_CC_2018_2021)
+    controller = SimpleNamespace(
+      frame=100,
+      gm_cc_last_direction_button=CruiseButtons.RES_ACCEL,
+      gm_cc_last_direction_frame=100,
+      gm_cc_pending_reverse_button=CruiseButtons.INIT,
+      gm_cc_pending_reverse_frame=0,
+    )
+
+    assert gmcan.stabilize_bolt_cc_button(controller, cp, CruiseButtons.DECEL_SET) == CruiseButtons.DECEL_SET
 
   def test_xt4_cc_redneck_spam_matches_physical_button_burst(self):
     packer = CANPacker(DBC[CAR.CADILLAC_XT4_CC][Bus.pt])

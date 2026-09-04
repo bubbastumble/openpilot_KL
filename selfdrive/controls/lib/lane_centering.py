@@ -14,11 +14,15 @@ _MAX_OFFSET = 0.3
 _MIN_CENTER_TO_LINE = 1.1
 _MAX_RAW_CORRECTION = 0.004
 _MAX_GAIN = 0.30
+_VISUAL_CORRECTION_EPSILON = 1e-6
 _SMOOTH_TAU = 0.4
+_SIGNAL_RELEASE_TAU = 0.20
+_CONFIDENCE_RELEASE_TAU = 0.20
+_CENTER_ERROR_DEADBAND = 0.08
 
 _E2E_MAX_PATH_STD = 0.35
-_E2E_BREAK_IN_START = 0.25
-_E2E_BREAK_IN_FULL = 0.75
+_E2E_BREAK_IN_START = 0.15
+_E2E_BREAK_IN_FULL = 0.50
 
 
 class LaneCenteringController:
@@ -28,7 +32,8 @@ class LaneCenteringController:
   def reset(self) -> None:
     self._correction = 0.0
 
-  def update(self, model_curvature, model_v2, v_ego, enabled, offset, e2e_authority, lat_active, model_valid) -> float:
+  def update(self, model_curvature, model_v2, v_ego, enabled, offset, e2e_authority, lat_active, model_valid,
+             pause_on_signal=False, turn_signal_active=False, driver_override=False) -> float:
     model_curvature = float(model_curvature)
 
     try:
@@ -47,6 +52,14 @@ class LaneCenteringController:
       self.reset()
       return model_curvature
 
+    if driver_override:
+      self.reset()
+      return model_curvature
+
+    if pause_on_signal and turn_signal_active:
+      self._correction = float(smooth_value(0.0, self._correction, _SIGNAL_RELEASE_TAU, dt=DT_CTRL))
+      return model_curvature + self._correction
+
     try:
       if model_v2.meta.laneChangeState != log.LaneChangeState.off:
         self.reset()
@@ -62,8 +75,8 @@ class LaneCenteringController:
       float(np.clip(e2e_authority, 0.0, 1.0)),
     )
     if not valid:
-      self.reset()
-      return model_curvature
+      self._correction = float(smooth_value(0.0, self._correction, _CONFIDENCE_RELEASE_TAU, dt=DT_CTRL))
+      return model_curvature + self._correction
 
     target = float(np.clip(raw_correction, -_MAX_RAW_CORRECTION, _MAX_RAW_CORRECTION)) * _MAX_GAIN
     self._correction = float(smooth_value(target, self._correction, _SMOOTH_TAU, dt=DT_CTRL))
@@ -77,7 +90,8 @@ class LaneCenteringController:
   def _covers(x, distance: float) -> bool:
     return bool(x[0] <= distance <= x[-1])
 
-  def _raw_correction(self, model_v2, v_ego: float, offset: float, e2e_authority: float) -> tuple[bool, float]:
+  @staticmethod
+  def _raw_correction(model_v2, v_ego: float, offset: float, e2e_authority: float) -> tuple[bool, float]:
     try:
       lane_lines = model_v2.laneLines
       probs = np.asarray(model_v2.laneLineProbs, dtype=float)
@@ -97,11 +111,13 @@ class LaneCenteringController:
       right_y = np.asarray(lane_lines[2].y, dtype=float)
       pos_x = np.asarray(model_v2.position.x, dtype=float)
       pos_y = np.asarray(model_v2.position.y, dtype=float)
-      if not (self._valid_path(left_x, left_y) and self._valid_path(right_x, right_y) and self._valid_path(pos_x, pos_y)):
+      if not (LaneCenteringController._valid_path(left_x, left_y) and
+              LaneCenteringController._valid_path(right_x, right_y) and
+              LaneCenteringController._valid_path(pos_x, pos_y)):
         return False, 0.0
 
       lookahead = float(np.clip(v_ego, 8.0, 35.0))
-      if not all(self._covers(x, lookahead) for x in (left_x, right_x, pos_x)):
+      if not all(LaneCenteringController._covers(x, lookahead) for x in (left_x, right_x, pos_x)):
         return False, 0.0
 
       left = float(np.interp(lookahead, left_x, left_y))
@@ -114,14 +130,19 @@ class LaneCenteringController:
       target_y = 0.5 * (left + right) + float(np.clip(offset, -max_safe_offset, max_safe_offset))
       model_y = float(np.interp(lookahead, pos_x, pos_y))
       error = target_y - model_y
+      error_abs = abs(error)
+      if error_abs <= _CENTER_ERROR_DEADBAND:
+        error = 0.0
+      else:
+        error = np.copysign(error_abs - _CENTER_ERROR_DEADBAND, error)
 
       try:
         pos_y_std = np.asarray(model_v2.position.yStd, dtype=float)
-        if self._valid_path(pos_x, pos_y_std):
+        if LaneCenteringController._valid_path(pos_x, pos_y_std):
           path_std = float(np.interp(lookahead, pos_x, pos_y_std))
           if 0.0 <= path_std <= _E2E_MAX_PATH_STD:
             break_in = np.clip(
-              (abs(error) - _E2E_BREAK_IN_START) / (_E2E_BREAK_IN_FULL - _E2E_BREAK_IN_START),
+              (error_abs - _E2E_BREAK_IN_START) / (_E2E_BREAK_IN_FULL - _E2E_BREAK_IN_START),
               0.0,
               1.0,
             )
@@ -132,3 +153,44 @@ class LaneCenteringController:
       return True, float(2.0 * error / lookahead ** 2)
     except (AttributeError, IndexError, TypeError, ValueError):
       return False, 0.0
+
+
+def get_raw_lane_centering_correction(model_v2, v_ego: float, offset: float,
+                                      e2e_authority: float) -> tuple[bool, float]:
+  """Return the instantaneous lane-centering correction without controller filtering."""
+  return LaneCenteringController._raw_correction(model_v2, v_ego, offset, e2e_authority)
+
+
+def get_lane_centering_visual_direction(model_v2, v_ego: float, offset: float, e2e_authority: float,
+                                        enabled: bool, lat_active: bool, pause_on_signal: bool = False,
+                                        turn_signal_active: bool = False,
+                                        applied_correction: float | None = None) -> int:
+  """Return 1 for a right correction, -1 for left, and 0 when no correction is active."""
+  if not enabled or not lat_active or (pause_on_signal and turn_signal_active):
+    return 0
+
+  try:
+    v_ego = float(v_ego)
+    offset = float(offset)
+    e2e_authority = float(e2e_authority)
+    if not np.isfinite([v_ego, offset, e2e_authority]).all() or v_ego < _MIN_V_EGO:
+      return 0
+    if model_v2.meta.laneChangeState != log.LaneChangeState.off:
+      return 0
+  except (AttributeError, TypeError, ValueError):
+    return 0
+
+  valid, correction = get_raw_lane_centering_correction(
+    model_v2,
+    v_ego,
+    float(np.clip(offset, -_MAX_OFFSET, _MAX_OFFSET)),
+    float(np.clip(e2e_authority, 0.0, 1.0)),
+  )
+  if not valid or not np.isfinite(correction):
+    return 0
+  if applied_correction is not None and np.isfinite(applied_correction) and \
+      abs(applied_correction) > _VISUAL_CORRECTION_EPSILON:
+    correction = float(applied_correction)
+  if abs(correction) <= _VISUAL_CORRECTION_EPSILON:
+    return 0
+  return 1 if correction > 0.0 else -1

@@ -98,6 +98,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   teslaCCNotArmed @27 :Bool;  # lateral engaged but DI_cruiseState != STANDBY/ENABLED
   accelHardCruise @28 :Bool;  # current/releasing accel cruise button came from GM hard-press signal
   decelHardCruise @29 :Bool;  # current/releasing decel cruise button came from GM hard-press signal
+  pulseAndGlide @30 :Bool;  # developer-only wheel-button pulse-and-glide mode is enabled
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -219,11 +220,27 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   disableThrottle @35 :Bool;
   trackingLead @36 :Bool;
   stopSignConfirmed @37 :Bool;
+  pulseGlideCoasting @38 :Bool;  # developer-only P&G phase for on-road status UI
+  # Curve Speed Controller diagnostics, for tuning and rollout validation
+  cscOverridden @39 :Bool;          # driver cancelled this curve with RES+
+  cscLearnedLatAccel @40 :Float32;  # learned comfort at the current curvature, before margin
+  cscBindingDistance @41 :Float32;  # distance to the horizon point setting the target, m
+  approachStopLength @42 :Float32;  # pre-commit distance to a detected stop, m; 0 when off
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {
   leadLeft @0 :LeadData;
   leadRight @1 :LeadData;
+  adjacentStopped @2 :AdjacentStopped;
+
+  # A vehicle in an adjacent lane that was observed MOVING and then came to rest.
+  # Distinct from leadLeft/leadRight, which are moving-target-only by design.
+  struct AdjacentStopped {
+    status @0 :Bool;
+    dRel @1 :Float32;
+    yRel @2 :Float32;
+    radarTrackId @3 :Int32 = -1;
+  }
 
   struct LeadData {
     dRel @0 :Float32;
@@ -253,6 +270,7 @@ struct StarPilotSelfdriveState @0xf416ec09499d9d19 {
   alertSize @3 :AlertSize;
   alertType @4 :Text;
   alertSound @5 :Car.CarControl.HUDControl.AudibleAlert;
+  vEgo @6 :Float32;
 
   enum AlertStatus {
     normal @0;
@@ -282,7 +300,15 @@ struct StarPilotLateralManeuverPlanDEPRECATED @0xcb9fd56c7057593a {
   desiredCurvature @0 :Float32;  # 1/m
 }
 
-struct CustomReserved11 @0xc2243c65e0340384 {
+struct StarPilotLateralState @0xc2243c65e0340384 {
+  active @0 :Bool;
+  frictionThreshold @1 :Float32;
+  frictionScale @2 :Float32;
+  feedforward @3 :Float32;
+  frictionJerk @4 :Float32;
+  frictionJerkDeadzone @5 :Float32;
+  lowSpeedFactor @6 :Float32;
+  unwindDetected @7 :Bool;
 }
 
 struct CustomReserved12 @0x9ccdc8676701b412 {

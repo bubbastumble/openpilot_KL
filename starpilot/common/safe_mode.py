@@ -4,6 +4,10 @@ from __future__ import annotations
 from cereal import log
 
 from openpilot.common.params import Params, UnknownKeyName
+from openpilot.starpilot.common.accel_profile import (
+  CUSTOM_ACCEL_PROFILE_BREAKPOINTS_INITIALIZED_KEY,
+  CUSTOM_ACCEL_PROFILE_CURVE_PARAM_KEYS,
+)
 
 SAFE_MODE_PARAM = "SafeMode"
 SAFE_MODE_BACKUP_PARAM = "SafeModeBackup"
@@ -19,8 +23,9 @@ SAFE_MODE_MANAGED_KEYS = (
   "ModelVersion",
   "DrivingModelVersion",
   "ModelRandomizer",
+  "LatSmoothSeconds",
+  "LongSmoothSeconds",
   "DisableOpenpilotLongitudinal",
-  "ForceFingerprint",
   "ClusterOffset",
   "LateralTune",
   "AdvancedLateralTune",
@@ -35,6 +40,7 @@ SAFE_MODE_MANAGED_KEYS = (
   "SteerRatio",
   "CameraOffset",
   "LaneCentering",
+  "LaneCenteringPauseOnSignal",
   "LaneCenteringE2EAuthority",
   "LaneCenterOffset",
   "LaneChanges",
@@ -48,6 +54,7 @@ SAFE_MODE_MANAGED_KEYS = (
   "NNFFLite",
   "TurnDesires",
   "NavDesiresAllowed",
+  "NavLanePositioningAllowed",
   "NavLongitudinalAllowed",
   "QOLLateral",
   "PauseLateralSpeed",
@@ -67,6 +74,8 @@ SAFE_MODE_MANAGED_KEYS = (
   "CustomAccelProfile45MPH",
   "CustomAccelProfile56MPH",
   "CustomAccelProfile89MPH",
+  CUSTOM_ACCEL_PROFILE_BREAKPOINTS_INITIALIZED_KEY,
+  *CUSTOM_ACCEL_PROFILE_CURVE_PARAM_KEYS,
   "LongitudinalActuatorDelay",
   "MaxDesiredAcceleration",
   "StartAccel",
@@ -88,7 +97,6 @@ SAFE_MODE_MANAGED_KEYS = (
   "MapGears",
   "MapAcceleration",
   "MapDeceleration",
-  "ReverseCruise",
   "SetSpeedOffset",
   "WeatherPresets",
   "IncreaseFollowingLowVisibility",
@@ -114,6 +122,7 @@ SAFE_MODE_MANAGED_KEYS = (
   "CELead",
   "CESlowerLead",
   "CEStoppedLead",
+  "CEOpenRoad",
   "CESpeed",
   "CESpeedLead",
   "CCMLead",
@@ -149,6 +158,8 @@ SAFE_MODE_MANAGED_KEYS = (
   "Offset7",
   "SpeedLimitFiller",
   "VisionSpeedLimitDetection",
+  "VisionSpeedLimitLowLimitFilter",
+  "VisionSpeedLimitLowLimitThreshold",
   "VASMEnabled",
   "CustomPersonalities",
   "TrafficPersonalityProfile",
@@ -186,6 +197,8 @@ SAFE_MODE_MANAGED_KEYS = (
   "ToyotaAutoHold",
   "SubaruSNG",
   "SubaruSNGManualParkingBrake",
+  "SubaruStopStartOff",
+  "SubaruAvhOnAtStartup",
   "VoltSNG",
   "JeepBrakeHold",
   "GMAutoHold",
@@ -195,10 +208,16 @@ SAFE_MODE_MANAGED_KEYS = (
   "LongPitch",
 )
 
+SAFE_MODE_PRESERVED_KEYS = (
+  "ForceFingerprint",
+)
+
 SAFE_MODE_FIXED_VALUES = {
   "ExperimentalMode": False,
   "LongitudinalPersonality": int(log.LongitudinalPersonality.relaxed),
   "UseAutoSteerDelay": True,
+  "SubaruStopStartOff": False,
+  "SubaruAvhOnAtStartup": False,
 }
 
 SAFE_MODE_STOCK_PARAM_MAP = {
@@ -279,11 +298,16 @@ def apply_safe_mode(params: Params, params_raw: Params, params_memory: Params | 
 
   if ensure_backup:
     backup = _load_backup(params_raw)
+    preserved_entries = {key: backup[key] for key in SAFE_MODE_PRESERVED_KEYS if key in backup}
     missing_backup_keys = [key for key in SAFE_MODE_MANAGED_KEYS if key not in backup]
-    if missing_backup_keys:
+    if missing_backup_keys or preserved_entries:
       backup = dict(backup)
       for key in missing_backup_keys:
         backup[key] = _current_entry(params_raw, key)
+      for key, entry in preserved_entries.items():
+        restore_value = entry.get("value") if entry.get("present") else None
+        changed |= _apply_value(params_raw, key, restore_value)
+        backup.pop(key, None)
       params_raw.put(SAFE_MODE_BACKUP_PARAM, backup)
       changed = True
 
@@ -323,7 +347,7 @@ def restore_safe_mode(params_raw: Params, params_memory: Params | None = None) -
       _mark_toggle_update(params_memory)
     return changed
 
-  restore_keys = dict.fromkeys((*SAFE_MODE_MANAGED_KEYS, *backup.keys()))
+  restore_keys = dict.fromkeys((*SAFE_MODE_MANAGED_KEYS, *(key for key in backup if key not in SAFE_MODE_PRESERVED_KEYS)))
   for key in restore_keys:
     entry = backup.get(key, {"present": False, "value": None})
     restore_value = entry.get("value") if entry.get("present") else None

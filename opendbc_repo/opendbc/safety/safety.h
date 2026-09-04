@@ -28,9 +28,11 @@
 #include "opendbc/safety/modes/elm327.h"
 #include "opendbc/safety/modes/body.h"
 #include "opendbc/safety/modes/psa.h"
+#include "opendbc/safety/modes/volvo.h"
 
 #ifdef CANFD
 #include "opendbc/safety/modes/hyundai_canfd.h"
+#include "opendbc/safety/modes/volkswagen_meb.h"
 #endif
 
 uint32_t GET_BYTES(const CANPacket_t *msg, int start, int len) {
@@ -57,6 +59,7 @@ bool steering_disengage;
 bool steering_disengage_prev;
 bool cruise_engaged_prev = false;
 struct sample_t vehicle_speed;
+struct sample_t vehicle_speed_2;
 bool vehicle_moving = false;
 bool acc_main_on = false;  // referred to as "ACC off" in ISO 15622:2018
 int cruise_button_prev = 0;
@@ -86,6 +89,8 @@ uint32_t rt_angle_msgs = 0;
 uint32_t ts_angle_check_last = 0;
 int desired_angle_last = 0;
 struct sample_t angle_meas;         // last 6 steer angles/curvatures
+
+CurvatureSteeringState curvature_state;
 
 
 int alternative_experience = 0;
@@ -425,8 +430,10 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
     {SAFETY_CHRYSLER_CUSW, &chrysler_cusw_hooks},
     {SAFETY_TESLA, &tesla_hooks},
     {SAFETY_TESLA_PREAP, &tesla_preap_hooks},
+    {SAFETY_VOLVO, &volvo_hooks},
 #ifdef CANFD
     {SAFETY_HYUNDAI_CANFD, &hyundai_canfd_hooks},
+    {SAFETY_VOLKSWAGEN_MEB, &volkswagen_meb_hooks},
 #endif
 #ifdef ALLOW_DEBUG
     {SAFETY_PSA, &psa_hooks},
@@ -457,6 +464,11 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
   rt_angle_msgs = 0;
   ts_angle_check_last = 0;
   desired_angle_last = 0;
+  curvature_state.desired_last = 0;
+  curvature_state.rt_msgs = 0;
+  curvature_state.rt_msgs_prev = 0;
+  curvature_state.ts_check_last = 0;
+  curvature_state.steer_power_last = 0;
   ts_torque_check_last = 0;
   ts_steer_req_mismatch_last = 0;
   valid_steer_req_count = 0;
@@ -464,9 +476,11 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
 
   // reset samples
   reset_sample(&vehicle_speed);
+  reset_sample(&vehicle_speed_2);
   reset_sample(&torque_meas);
   reset_sample(&torque_driver);
   reset_sample(&angle_meas);
+  reset_sample(&curvature_state.meas);
 
   controls_allowed = false;
   relay_malfunction_reset();

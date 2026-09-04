@@ -8,7 +8,7 @@ hyundai_checksum = crcmod.mkCrcFun(0x11D, initCrc=0xFD, rev=False, xorOut=0xdf)
 def create_lkas11(packer, frame, CP, apply_torque, steer_req,
                   torque_fault, lkas11, sys_warning, sys_state, enabled,
                   left_lane, right_lane,
-                  left_lane_depart, right_lane_depart):
+                  left_lane_depart, right_lane_depart, lka_icon):
   values = {s: lkas11[s] for s in [
     "CF_Lkas_LdwsActivemode",
     "CF_Lkas_LdwsSysState",
@@ -40,7 +40,7 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
                            CAR.HYUNDAI_ELANTRA_HEV_2021, CAR.HYUNDAI_SONATA_HYBRID, CAR.HYUNDAI_KONA_EV, CAR.HYUNDAI_KONA_HEV, CAR.HYUNDAI_KONA_EV_2022,
                            CAR.HYUNDAI_SANTA_FE_2022, CAR.KIA_K5_2021, CAR.HYUNDAI_IONIQ_HEV_2022, CAR.HYUNDAI_SANTA_FE_HEV_2022,
                            CAR.HYUNDAI_SANTA_FE_PHEV_2022, CAR.KIA_STINGER_2022, CAR.KIA_K5_HEV_2020, CAR.KIA_CEED, CAR.KIA_XCEED_PHEV,
-                           CAR.HYUNDAI_AZERA_6TH_GEN, CAR.HYUNDAI_AZERA_HEV_6TH_GEN, CAR.HYUNDAI_CUSTIN_1ST_GEN, CAR.HYUNDAI_KONA_2022,
+                           CAR.HYUNDAI_AZERA_6TH_GEN, CAR.HYUNDAI_AZERA_HEV_6TH_GEN, CAR.HYUNDAI_CUSTIN_1ST_GEN, CAR.HYUNDAI_KONA_2022, CAR.KIA_RAY_EV,
                            CAR.HYUNDAI_ELANTRA_2024, CAR.HYUNDAI_ELANTRA_HEV_2024):
     values["CF_Lkas_LdwsActivemode"] = int(left_lane) + (int(right_lane) << 1)
     values["CF_Lkas_LdwsOpt_USM"] = 2
@@ -51,7 +51,7 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
     # FcwOpt_USM 2 = Green car + lanes
     # FcwOpt_USM 1 = White car + lanes
     # FcwOpt_USM 0 = No car + lanes
-    values["CF_Lkas_FcwOpt_USM"] = 2 if enabled else 1
+    values["CF_Lkas_FcwOpt_USM"] = lka_icon if CP.carFingerprint == CAR.GENESIS_G70_2020 else 2 if enabled else 1
 
     # SysWarning 4 = keep hands on wheel
     # SysWarning 5 = keep hands on wheel (red)
@@ -60,7 +60,7 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
     values["CF_Lkas_SysWarning"] = 4 if sys_warning else 0
 
   # Likely cars lacking the ability to show individual lane lines in the dash
-  elif CP.carFingerprint in (CAR.KIA_OPTIMA_G4, CAR.KIA_OPTIMA_G4_FL):
+  elif CP.carFingerprint in (CAR.KIA_OPTIMA_G4, CAR.KIA_OPTIMA_G4_FL, CAR.HYUNDAI_KONA_NON_SCC):
     # SysWarning 4 = keep hands on wheel + beep
     values["CF_Lkas_SysWarning"] = 4 if sys_warning else 0
 
@@ -68,7 +68,7 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
     # SysState 1-2 = white car + lanes
     # SysState 3 = green car + lanes, green steering wheel
     # SysState 4 = green car + lanes
-    values["CF_Lkas_LdwsSysState"] = 3 if enabled else 1
+    values["CF_Lkas_LdwsSysState"] = lka_icon if CP.carFingerprint == CAR.HYUNDAI_KONA_NON_SCC else 3 if enabled else 1
     values["CF_Lkas_LdwsOpt_USM"] = 2  # non-2 changes above SysState definition
 
     # these have no effect
@@ -79,6 +79,14 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
     # This field is actually LdwsActivemode
     # Genesis and Optima fault when forwarding while engaged
     values["CF_Lkas_LdwsActivemode"] = 2
+
+  if CP.carFingerprint == CAR.KIA_RAY_EV:
+    if not enabled:
+      values["CF_Lkas_LdwsActivemode"] = lkas11["CF_Lkas_LdwsActivemode"]
+      values["CF_Lkas_LdwsSysState"] = lkas11["CF_Lkas_LdwsSysState"]
+      values["CF_Lkas_FcwOpt_USM"] = lkas11["CF_Lkas_FcwOpt_USM"]
+    values["CF_Lkas_LdwsOpt_USM"] = 0
+    values["CF_Lkas_Chksum"] = 0
 
   dat = packer.make_can_msg("LKAS11", 0, values)[1]
 
@@ -98,6 +106,19 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
   return packer.make_can_msg("LKAS11", 0, values)
 
 
+def create_lkas12(packer, lkas12):
+  values = {s: lkas12[s] for s in (
+    "CF_Lkas_TsrSlifOpt",
+    "CF_LkasTsrStatus",
+    "CF_Lkas_TsrSpeed_Display_Clu",
+    "CF_LkasTsrSpeed_Display_Navi",
+    "CF_Lkas_TsrAddinfo_Display",
+    "CF_Lkas_Daw_USM",
+  ) if s in lkas12}
+  values["CF_LkasDawStatus"] = 0
+  return packer.make_can_msg("LKAS12", 0, values)
+
+
 def create_checksum_can_canfd_blended(packer, bus, addr, values):
   dat = packer.make_can_msg(addr, bus, values)[1]
   return hyundai_checksum(dat[1:8])
@@ -106,7 +127,8 @@ def create_checksum_can_canfd_blended(packer, bus, addr, values):
 def create_lkas11_can_canfd_blended(packer, frame, CP, apply_steer, steer_req,
                                     torque_fault, lkas11, sys_warning, sys_state, enabled,
                                     left_lane, right_lane,
-                                    left_lane_depart, right_lane_depart, msg_364):
+                                    left_lane_depart, right_lane_depart, msg_364,
+                                    include_alerts=True, counter_mod=0x10):
   bus = CanBus(CP).ECAN
   values = {
     "CF_Lkas_LdwsActivemode": int(left_lane) + (int(right_lane) << 1),
@@ -116,7 +138,7 @@ def create_lkas11_can_canfd_blended(packer, frame, CP, apply_steer, steer_req,
     "CR_Lkas_StrToqReq": apply_steer,
     "CF_Lkas_ActToi": steer_req,
     "CF_Lkas_ToiFlt": torque_fault,
-    "CF_Lkas_MsgCount": frame % 0x10,
+    "CF_Lkas_MsgCount": frame % counter_mod,
     "NEW_SIGNAL_1": 0,
     "NEW_SIGNAL_5": 100,
   }
@@ -130,13 +152,13 @@ def create_lkas11_can_canfd_blended(packer, frame, CP, apply_steer, steer_req,
   alerts_364.setdefault("BYTE5", 0)
   alerts_364.setdefault("BYTE6", 0)
   alerts_364.setdefault("BYTE7", 0)
-  alerts_364["COUNTER"] = frame % 0x10
+  alerts_364["COUNTER"] = frame % counter_mod
   alerts_364["CHECKSUM"] = create_checksum_can_canfd_blended(packer, bus, "ALERTS_364", alerts_364)
 
-  return [
-    packer.make_can_msg("LKAS11", bus, values),
-    packer.make_can_msg("ALERTS_364", bus, alerts_364),
-  ]
+  ret = [packer.make_can_msg("LKAS11", bus, values)]
+  if include_alerts:
+    ret.append(packer.make_can_msg("ALERTS_364", bus, alerts_364))
+  return ret
 
 
 def create_clu11(packer, frame, clu11, button, CP):
@@ -233,11 +255,62 @@ def create_acc_commands_can_canfd_blended(packer, enabled, accel, upper_jerk, id
   return commands
 
 
-def create_acc_commands(packer, enabled, accel, upper_jerk, idx, hud_control, set_speed, stopping, long_override, use_fca, CP):
+def create_acc_commands_can_canfd_blended_hda2(packer, enabled, accel, accel_last, upper_jerk, idx,
+                                               hud_control, set_speed, stopping, long_override, use_fca, CP):
+  commands = []
+  bus = CanBus(CP).ECAN
+  jerk = 5.0
+
+  if not enabled or long_override:
+    accel_raw, accel_value = 0.0, 0.0
+  else:
+    accel_raw = accel
+    accel_value = max(accel_last - jerk / 50.0, min(accel, accel_last + jerk / 50.0))
+
+  message_values = [
+    ("SCC11", {
+      "aReqRaw": accel_raw,
+      "aReqValue": accel_value,
+      "JerkUpperLimit": upper_jerk,
+      "JerkLowerLimit": jerk if enabled else 1.0,
+    }),
+    ("SCC12", {
+      "MainMode_ACC": 1,
+      "ACCMode_Inactive": 0 if enabled else 1,
+      "TauGapSet": hud_control.leadDistanceBars,
+      "VSetDis": set_speed,
+      "ACC_ObjDist": 1,
+      "ACCMode": 2 if enabled and long_override else 1 if enabled else 0,
+      "StopReq": 1 if stopping else 0,
+    }),
+    ("SCC14", {
+      "ACC_ObjRelSpd": 0,
+      "ObjValid": 0,
+      "ObjStatus": 2 if hud_control.leadVisible and enabled else 1 if hud_control.leadVisible else 0,
+    }),
+  ]
+
+  if use_fca and not (CP.flags & HyundaiFlags.CAMERA_SCC):
+    # These values reproduce the stock status bytes without requesting AEB/FCA actuation.
+    message_values.append(("FCA11", {
+      "cr_vsm_deccmd": 255,
+      "cf_vsm_deccmdact": 0,
+    }))
+
+  for name, values in message_values:
+    values["COUNTER"] = idx % 0xF
+    values["CHECKSUM"] = create_checksum_can_canfd_blended(packer, bus, name, values)
+    commands.append(packer.make_can_msg(name, bus, values))
+
+  return commands
+
+
+def create_acc_commands(packer, enabled, accel, upper_jerk, idx, hud_control, set_speed, stopping, long_override, use_fca, CP,
+                        main_cruise_enabled=True):
   commands = []
 
   scc11_values = {
-    "MainMode_ACC": 1,
+    "MainMode_ACC": int(bool(main_cruise_enabled)),
     "TauGapSet": hud_control.leadDistanceBars,
     "VSetDis": set_speed if enabled else 0,
     "AliveCounterACC": idx % 0x10,
@@ -324,17 +397,27 @@ def create_frt_radar_opt(packer):
   return packer.make_can_msg("FRT_RADAR11", 0, frt_radar11_values)
 
 
-def create_radar_aux_messages(packer, CAN, frame):
+def create_radar_aux_messages(packer, CAN, frame, hda2=False):
   commands = []
 
-  for addr, freq, values in (
+  message_specs = (
+    ("RADAR_0x363", 2, {"FCA_ESA": 1}),
+    ("RADAR_0x398", 5, {"BYTE4": 0x80, "BYTE5": 0x5D}),
+    ("RADAR_0x399", 5, {"BYTE2": 0x02}),
+    ("RADAR_0x39a", 5, {"BYTE7": 0xFF}),
+    ("RADAR_0x39b", 5, {}),
+    ("RADAR_0x39c", 5, {"BYTE5": 0xE0, "BYTE6": 0x79}),
+    ("RADAR_0x43a", 20, {"BYTE2": 0x07}),
+  ) if hda2 else (
     ("RADAR_0x363", 2, {"FCA_ESA": 1}),
     ("RADAR_0x398", 5, {"BYTE4": 0x80, "BYTE5": 0x10}),
-  ):
+  )
+
+  for addr, freq, values in message_specs:
     if frame % freq != 0:
       continue
 
-    msg_values = values | {"COUNTER": frame % 0x10}
+    msg_values = values | {"COUNTER": frame % (0xF if hda2 else 0x10)}
     msg_values["CHECKSUM"] = create_checksum_can_canfd_blended(packer, CAN.ECAN, addr, msg_values)
     commands.append(packer.make_can_msg(addr, CAN.ECAN, msg_values))
 

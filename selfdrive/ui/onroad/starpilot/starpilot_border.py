@@ -11,6 +11,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.lib.starpilot_status import (
   CEM_OVERRIDE_COLOR, ENGAGED_COLOR, EXPERIMENTAL_COLOR, TRAFFIC_COLOR
 )
+from openpilot.selfdrive.ui.lib.starpilot_visuals import get_border_roundness
 
 
 
@@ -39,6 +40,7 @@ _GREEN = rl.Color(34, 197, 94, 255)
 _AMBER = rl.Color(251, 191, 36, 255)
 _ORANGE = rl.Color(234, 88, 12, 255)
 _RED = rl.Color(201, 34, 49, 255)
+_TRAINING = rl.Color(112, 192, 216, 255)
 
 _last_was_active = False
 _activation_start = 0.0
@@ -56,7 +58,8 @@ def _csc_state():
     return None
 
   plan = sm["starpilotPlan"]
-  if plan.speedLimitChanged or not ui_state.params.get_bool("ShowCSCStatus"):
+  params = ui_state.ui_params
+  if not params.get_bool("ShowCSCStatus"):
     return None
 
   car_state = sm["carState"]
@@ -112,7 +115,8 @@ def _render_csc_glow(border_rect: rl.Rectangle, border_width: float = UI_BORDER_
   state = _csc_state()
   now = rl.get_time()
 
-  if state is None or not state['active']:
+  visible = state is not None and (state['active'] or state['training'])
+  if not visible:
     if _last_was_active:
       _fade_out_start = now
       _last_was_active = False
@@ -130,9 +134,9 @@ def _render_csc_glow(border_rect: rl.Rectangle, border_width: float = UI_BORDER_
       _fade_out_start = 0.0
     _last_was_active = True
 
-    intensity = _intensity(state['curvature'])
+    intensity = _intensity(state['curvature']) if state['active'] else _GLOW_BASE_INTENSITY
     period = _glow_period(intensity)
-    color = _glow_color(intensity)
+    color = _glow_color(intensity) if state['active'] else _TRAINING
     t_norm = max(0.0, min(1.0, (intensity - _GLOW_BASE_INTENSITY) / (1.0 - _GLOW_BASE_INTENSITY)))
     _last_state = (intensity, period, color, t_norm)
     fade = min(1.0, (now - _activation_start) / _GLOW_FADE_IN_DURATION)
@@ -169,59 +173,71 @@ def _render_csc_glow(border_rect: rl.Rectangle, border_width: float = UI_BORDER_
 _smoothed_steer = 0.0
 
 
+def get_traffic_border_colors() -> tuple[rl.Color, rl.Color] | None:
+  sm = ui_state.sm
+  car_state = sm["carState"] if sm.valid.get("carState", False) else None
+  if car_state is None:
+    return None
+  params = ui_state.ui_params
+  show_signal = params.get_bool("SignalMetrics")
+  show_blindspot = params.get_bool("BlindSpotMetrics")
+  if not (show_signal or show_blindspot):
+    return None
+
+  left_blindspot = car_state.leftBlindspot
+  right_blindspot = car_state.rightBlindspot
+  if ui_state.starpilot_toggles.get("v_asm_enabled", False):
+    vasm_left, vasm_right = get_fresh_vasm_state(ui_state.params_memory)
+    left_blindspot = left_blindspot or vasm_left
+    right_blindspot = right_blindspot or vasm_right
+  left_blinker = car_state.leftBlinker
+  right_blinker = car_state.rightBlinker
+
+  if not ((show_signal and (left_blinker or right_blinker)) or (show_blindspot and (left_blindspot or right_blindspot))):
+    return None
+
+  interval = 250 if show_blindspot and (left_blindspot or right_blindspot) else 500
+  flicker_active = (int(rl.get_time() * 1000) % (interval * 2)) < interval
+
+  def get_half_border_color(blindspot, turn_signal):
+    if turn_signal and show_signal:
+      if blindspot:
+        return TRAFFIC_COLOR if flicker_active else CEM_OVERRIDE_COLOR
+      else:
+        return CEM_OVERRIDE_COLOR if flicker_active else rl.Color(0, 0, 0, 0)
+    elif blindspot and show_blindspot:
+      return TRAFFIC_COLOR
+    else:
+      return rl.Color(0, 0, 0, 0)
+
+  left_color = get_half_border_color(left_blindspot, left_blinker)
+  right_color = get_half_border_color(right_blindspot, right_blinker)
+
+  return left_color, right_color
+
+
 def render_background_effects(rect: rl.Rectangle, border_width: float):
   global _smoothed_steer
   sm = ui_state.sm
+  border_roundness = get_border_roundness(rect, border_width)
 
   # 1. Turn Signal and Blind Spot indicators
-  car_state = sm["carState"] if sm.valid.get("carState", False) else None
-  if car_state:
-    show_signal = ui_state.params.get_bool("SignalMetrics")
-    show_blindspot = ui_state.params.get_bool("BlindSpotMetrics")
-    if show_signal or show_blindspot:
-      left_blindspot = car_state.leftBlindspot
-      right_blindspot = car_state.rightBlindspot
-      if ui_state.starpilot_toggles.get("v_asm_enabled", False):
-        vasm_left, vasm_right = get_fresh_vasm_state(ui_state.params_memory)
-        left_blindspot = left_blindspot or vasm_left
-        right_blindspot = right_blindspot or vasm_right
-      left_blinker = car_state.leftBlinker
-      right_blinker = car_state.rightBlinker
-
-      if (show_signal and (left_blinker or right_blinker)) or (show_blindspot and (left_blindspot or right_blindspot)):
-        interval = 250 if show_blindspot and (left_blindspot or right_blindspot) else 500
-        flicker_active = (int(rl.get_time() * 1000) % (interval * 2)) < interval
-
-        def get_half_border_color(blindspot, turn_signal):
-          if turn_signal and show_signal:
-            if blindspot:
-              return TRAFFIC_COLOR if flicker_active else CEM_OVERRIDE_COLOR
-            else:
-              return CEM_OVERRIDE_COLOR if flicker_active else rl.Color(0, 0, 0, 0)
-          elif blindspot and show_blindspot:
-            return TRAFFIC_COLOR
-          else:
-            return rl.Color(0, 0, 0, 0)
-
-        left_color = get_half_border_color(left_blindspot, left_blinker)
-        right_color = get_half_border_color(right_blindspot, right_blinker)
-
-        # Draw left side borders
-        if left_color.a > 0:
-          rl.begin_scissor_mode(int(rect.x), int(rect.y), int(rect.width // 2), int(rect.height))
-          rl.draw_rectangle_rounded(rect, 0.12, 10, left_color)
-          rl.end_scissor_mode()
-
-        # Draw right side borders
-        if right_color.a > 0:
-          rl.begin_scissor_mode(int(rect.x + rect.width // 2), int(rect.y), int(rect.width // 2), int(rect.height))
-          rl.draw_rectangle_rounded(rect, 0.12, 10, right_color)
-          rl.end_scissor_mode()
+  colors = get_traffic_border_colors()
+  if colors is not None:
+    left_color, right_color = colors
+    if left_color.a > 0:
+      rl.begin_scissor_mode(int(rect.x), int(rect.y), int(rect.width // 2), int(rect.height))
+      rl.draw_rectangle_rounded(rect, border_roundness, 10, left_color)
+      rl.end_scissor_mode()
+    if right_color.a > 0:
+      rl.begin_scissor_mode(int(rect.x + rect.width // 2), int(rect.y), int(rect.width // 2), int(rect.height))
+      rl.draw_rectangle_rounded(rect, border_roundness, 10, right_color)
+      rl.end_scissor_mode()
 
   # 2. Steering Torque Border
   car_control = sm["carControl"] if sm.valid.get("carControl", False) else None
   if car_control:
-    show_steering = ui_state.params.get_bool("ShowSteering")
+    show_steering = ui_state.ui_params.get_bool("ShowSteering")
     if show_steering:
       torque = -car_control.actuators.torque
       abs_torque = abs(torque)
@@ -248,7 +264,7 @@ def render_background_effects(rect: rl.Rectangle, border_width: float):
         else:
           rl.begin_scissor_mode(int(rect.x + rect.width - border_width), y_pos, int(border_width), int(visible_height))
 
-        rl.draw_rectangle_rounded(rect, 0.12, 10, col)
+        rl.draw_rectangle_rounded(rect, border_roundness, 10, col)
         rl.end_scissor_mode()
 
 

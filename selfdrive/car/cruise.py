@@ -49,6 +49,9 @@ class VCruiseHelper:
     }
     self.button_hard_states = dict.fromkeys(self.button_timers, False)
     self.button_change_states = {btn: {"standstill": False, "enabled": False} for btn in self.button_timers}
+    # Keep the confirmation button from leaking into cruise-speed handling when the
+    # planner clears the confirmation state between the press and release events.
+    self.confirmation_button_suppressed = set()
 
     self.gm_cc_only = self.CP.carFingerprint in CC_ONLY_CAR and self.CP.flags & GMFlags.CC_LONG.value
     self.redneck_non_pcm = bool(FPCP is not None and
@@ -66,10 +69,6 @@ class VCruiseHelper:
   def _get_cruise_delta_intervals(self, starpilot_toggles: SimpleNamespace) -> tuple[float, float]:
     short_interval = self._get_cruise_delta_interval(getattr(starpilot_toggles, "cruise_increase", None))
     long_interval = self._get_cruise_delta_interval(getattr(starpilot_toggles, "cruise_increase_long", None))
-
-    if getattr(starpilot_toggles, "reverse_cruise_increase", False):
-      return long_interval, short_interval
-
     return short_interval, long_interval
 
   @property
@@ -86,13 +85,15 @@ class VCruiseHelper:
       return bool(getattr(starpilot_car_state, "decelHardCruise", False))
     return False
 
-  def update_v_cruise(self, CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state=None):
+  def update_v_cruise(self, CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state=None,
+                      slc_target_with_offset=0.0):
     self.v_cruise_kph_last = self.v_cruise_kph
 
     if CS.cruiseState.available:
       if self.gm_cc_only or self.redneck_non_pcm or not self.CP.pcmCruise:
         # if stock cruise is completely disabled, then we can use our own set speed logic
-        self._update_v_cruise_non_pcm(CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state)
+        self._update_v_cruise_non_pcm(CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state,
+                                      slc_target_with_offset)
         self.v_cruise_cluster_kph = self.v_cruise_kph
         self.update_button_timers(CS, enabled, starpilot_car_state)
       else:
@@ -108,7 +109,8 @@ class VCruiseHelper:
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
-  def _update_v_cruise_non_pcm(self, CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state=None):
+  def _update_v_cruise_non_pcm(self, CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state=None,
+                                slc_target_with_offset=0.0):
     # handle button presses. TODO: this should be in state_control, but a decelCruise press
     # would have the effect of both enabling and changing speed is checked after the state transition
     if not enabled:
@@ -119,6 +121,15 @@ class VCruiseHelper:
     button_is_hard = False
 
     v_cruise_delta = 1. if is_metric else IMPERIAL_INCREMENT
+
+    for b in CS.buttonEvents:
+      event_button_type = b.type.raw
+      if event_button_type in self.button_timers:
+        if speed_limit_changed and b.pressed:
+          self.confirmation_button_suppressed.add(event_button_type)
+        elif not b.pressed and event_button_type in self.confirmation_button_suppressed:
+          self.confirmation_button_suppressed.remove(event_button_type)
+          return
 
     for b in CS.buttonEvents:
       if b.type.raw in self.button_timers and not b.pressed:
@@ -138,6 +149,9 @@ class VCruiseHelper:
     if button_type is None:
       return
 
+    if button_type in self.confirmation_button_suppressed:
+      return
+
     # Don't adjust speed when pressing to confirm or deny speed limit changes
     if speed_limit_changed:
       return
@@ -154,10 +168,21 @@ class VCruiseHelper:
     short_interval, long_interval = self._get_cruise_delta_intervals(starpilot_toggles)
     v_cruise_delta_interval = long_interval if long_press or button_is_hard else short_interval
     v_cruise_delta = v_cruise_delta * v_cruise_delta_interval
+    previous_v_cruise_kph = self.v_cruise_kph
     if v_cruise_delta_interval % 5 == 0 and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval
       self.v_cruise_kph = CRUISE_NEAREST_FUNC[button_type](self.v_cruise_kph / v_cruise_delta) * v_cruise_delta
     else:
       self.v_cruise_kph += v_cruise_delta * CRUISE_INTERVAL_SIGN[button_type]
+
+    # Round to stored cruise-speed precision so the SLC target can be matched exactly.
+    slc_target_with_offset_kph = round(slc_target_with_offset * CV.MS_TO_KPH, 1)
+    # Preserve an active SLC target when an accel increment would otherwise skip it.
+    crossed_slc_target = (
+      button_type in ACCEL_CRUISE_BUTTONS and
+      previous_v_cruise_kph < slc_target_with_offset_kph < self.v_cruise_kph
+    )
+    if crossed_slc_target:
+      self.v_cruise_kph = slc_target_with_offset_kph
 
     # If set is pressed while overriding, clip cruise speed to minimum of vEgo
     if CS.gasPressed and button_type in (ButtonType.decelCruise, ButtonType.setCruise):

@@ -1,5 +1,7 @@
 from opendbc.car.ford.values import FordSafetyFlags
 from opendbc.car.hyundai.values import HyundaiSafetyFlags
+from opendbc.car.rivian.values import RivianSafetyFlags
+from opendbc.car.subaru.values import SubaruSafetyFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
 from opendbc.car.structs import CarParams
 from opendbc.safety.tests.libsafety import libsafety_py
@@ -32,7 +34,7 @@ def is_steering_msg(mode, param, addr):
   elif mode == CarParams.SafetyModel.chrysler:
     ret = addr == 0x292
   elif mode == CarParams.SafetyModel.subaru:
-    ret = addr == 0x122
+    ret = addr == (0x124 if param & SubaruSafetyFlags.LKAS_ANGLE else 0x122)
   elif mode == CarParams.SafetyModel.ford:
     ret = addr == (0x3ca if param & FordSafetyFlags.LKA_STEERING else
                    0x3d6 if param & FordSafetyFlags.CANFD else
@@ -40,7 +42,7 @@ def is_steering_msg(mode, param, addr):
   elif mode == CarParams.SafetyModel.nissan:
     ret = addr == 0x169
   elif mode == CarParams.SafetyModel.rivian:
-    ret = addr == 0x120
+    ret = addr == (0x110 if param & RivianSafetyFlags.ANGLE_CONTROL else 0x120)
   elif mode == CarParams.SafetyModel.tesla:
     ret = addr == 0x488
   return ret
@@ -76,8 +78,11 @@ def get_steer_value(mode, param, msg):
   elif mode == CarParams.SafetyModel.chrysler:
     torque = (((msg.data[0] & 0x7) << 8) | msg.data[1]) - 1024
   elif mode == CarParams.SafetyModel.subaru:
-    torque = ((msg.data[3] & 0x1F) << 8) | msg.data[2]
-    torque = -to_signed(torque, 13)
+    if param & SubaruSafetyFlags.LKAS_ANGLE:
+      angle = -to_signed((msg.data[5] | (msg.data[6] << 8) | (msg.data[7] << 16)) & 0x1FFFF, 17)
+    else:
+      torque = ((msg.data[3] & 0x1F) << 8) | msg.data[2]
+      torque = -to_signed(torque, 13)
   elif mode == CarParams.SafetyModel.ford:
     if param & FordSafetyFlags.LKA_STEERING:
       action = msg.data[0] >> 5
@@ -90,7 +95,10 @@ def get_steer_value(mode, param, msg):
     angle = (msg.data[0] << 10) | (msg.data[1] << 2) | (msg.data[2] >> 6)
     angle = -angle + (1310 * 100)
   elif mode == CarParams.SafetyModel.rivian:
-    torque = ((msg.data[2] << 3) | (msg.data[3] >> 5)) - 1024
+    if param & RivianSafetyFlags.ANGLE_CONTROL:
+      angle = ((msg.data[2] << 7) | (msg.data[3] >> 1)) - 16384
+    else:
+      torque = ((msg.data[2] << 3) | (msg.data[3] >> 5)) - 1024
   elif mode == CarParams.SafetyModel.tesla:
     angle = (((msg.data[0] & 0x7F) << 8) | (msg.data[1])) - 16384  # ceil(1638.35/0.1)
   return torque, angle

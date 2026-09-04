@@ -1,5 +1,5 @@
 from cereal import log
-from openpilot.common.params import Params, UnknownKeyName
+from openpilot.common.params import UnknownKeyName
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.list_view import multiple_button_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
@@ -38,7 +38,7 @@ DESCRIPTIONS = {
 class TogglesLayout(Widget):
   def __init__(self):
     super().__init__()
-    self._params = ui_state.params
+    self._params = ui_state.ui_params
     self._sync_rhd_toggle()
 
     # param, title, desc, icon, needs_restart
@@ -189,10 +189,21 @@ class TogglesLayout(Widget):
     )
 
     if ui_state.CP is not None:
-      if ui_state.has_longitudinal_control:
+      if ui_state.experimental_mode_available:
         self._toggles["ExperimentalMode"].action_item.set_enabled(not safe_mode)
-        self._toggles["ExperimentalMode"].set_description(e2e_description)
-        self._long_personality_setting.action_item.set_enabled(not safe_mode)
+        if ui_state.has_longitudinal_control:
+          self._toggles["ExperimentalMode"].set_description(e2e_description)
+        else:
+          lateral_only_description = tr(
+            "Lateral-only experimental mode is enabled for this stock-ACC vehicle for testing. "
+            "Openpilot will not control gas or brakes; the stock ACC remains responsible for speed."
+          )
+          self._toggles["ExperimentalMode"].set_description(
+            "<b>" + lateral_only_description + "</b><br><br>" + tr(
+              "The experimental visualization and driving-model features remain available."
+            )
+          )
+        self._long_personality_setting.action_item.set_enabled(not safe_mode and ui_state.has_longitudinal_control)
       else:
         # no long for now
         self._toggles["ExperimentalMode"].action_item.set_enabled(False)

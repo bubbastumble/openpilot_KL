@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from opendbc.car import structs
 from opendbc.car.chrysler.values import pacifica_hybrid_aol_requires_set_press
 from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR, HyundaiFlags
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
@@ -14,9 +15,20 @@ from openpilot.starpilot.common.experimental_state import (
   sync_manual_cc_state,
   sync_manual_ce_state,
 )
-from openpilot.starpilot.common.favorite_slots import toggle_favorite_slot
-from openpilot.starpilot.common.starpilot_utilities import is_FrogsGoMoo
-from openpilot.starpilot.common.starpilot_variables import ERROR_LOGS_PATH, GearShifter, NON_DRIVING_GEARS
+from openpilot.starpilot.common.favorite_slots import FAVORITE_ACTION_TRAFFIC_MODE_COUNTER, toggle_favorite_slot
+from openpilot.starpilot.common.starpilot_variables import (
+  ERROR_LOGS_PATH,
+  GearShifter,
+  NON_DRIVING_GEARS,
+  always_on_lateral_available,
+)
+from openpilot.starpilot.common.lateral_only_experimental import experimental_mode_available
+from openpilot.starpilot.system.wheel_controls import (
+  CONTROLLER_ACTION_COUNTERS,
+  CONTROLLER_ACTION_FORCE_COAST,
+  CONTROLLER_ACTION_PULSE_AND_GLIDE,
+  CONTROLLER_ACTION_TOGGLE_AOL,
+)
 
 HYUNDAI_MAIN_CRUISE_AOL_CONFIRM_TIMEOUT_FRAMES = 100
 
@@ -29,6 +41,7 @@ class StarPilotCard:
 
   def __init__(self, CP, FPCP):
     self.CP = CP
+    self.always_on_lateral_supported = always_on_lateral_available(CP)
 
     self.params = Params(return_defaults=True)
     self.params_memory = Params(memory=True)
@@ -46,15 +59,22 @@ class StarPilotCard:
       self.CP.brand == "hyundai" and not (hyundai_flags & HyundaiFlags.CANFD) and not hyundai_aol_before_engagement
     )
     self.hyundai_aol_ready = False
-    self.main_cruise_aol_pending = False
-    self.main_cruise_aol_pending_frames = 0
+    self.g70_main_cruise_aol_pending = False
+    self.g70_main_cruise_aol_pending_frames = 0
     self.prev_cruise_available = None
     self.prev_active = False
     self.prev_cruise_enabled = False
     self.decel_pressed = False
     self.cancelPressed_previously = False
+    self.cancel_pulse_glide_suppressed = False
     self.distancePressed_previously = False
     self.force_coast = False
+    self.pulse_and_glide = False
+    self._controller_action_counters = {
+      key: self._get_controller_action_counter(counter)
+      for key, counter in CONTROLLER_ACTION_COUNTERS.items()
+      if counter != "WheelButtonBookmarkCounter"
+    }
     self.modePressed_previously = False
     self.mode_counter = 0
     self.customPressed_previously = False
@@ -63,27 +83,39 @@ class StarPilotCard:
     self.pause_longitudinal = False
     self.switchback_mode_enabled = self.params_memory.get_bool("SwitchbackModeEnabled")
     self.traffic_mode_enabled = False
+    self._favorite_traffic_mode_counter = self.params_memory.get_int(FAVORITE_ACTION_TRAFFIC_MODE_COUNTER)
 
     self.gap_counter = 0
     self.cancel_counter = 0
     self._distance_poll_counter = 0
     self._onroad_distance_pressed = False
 
-    self.always_on_lateral_set = bool(FPCP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
-    self.frogs_go_moo = is_FrogsGoMoo()
-
+    self.always_on_lateral_set = (
+      self.always_on_lateral_supported and
+      bool(FPCP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    )
     self.long_press_threshold = CRUISE_LONG_PRESS
     self.very_long_press_threshold = CRUISE_LONG_PRESS * 5
 
     self.error_log = ERROR_LOGS_PATH / "error.txt"
 
   def handle_button_event(self, key, sm, starpilot_toggles):
-    if sm["carControl"].longActive and getattr(starpilot_toggles, f"experimental_mode_via_{key}"):
+    experimental_active = bool(getattr(sm["carControl"], "longActive", False) or
+                                getattr(sm["carControl"], "latActive", False))
+    mode_available = getattr(starpilot_toggles, "experimental_mode_available",
+                             bool(getattr(sm["carControl"], "longActive", False) or
+                                  experimental_mode_available(self.CP)))
+    if (experimental_active and mode_available and
+        getattr(starpilot_toggles, f"experimental_mode_via_{key}")):
       self.handle_experimental_mode(sm, starpilot_toggles)
     elif getattr(starpilot_toggles, f"bookmark_via_{key}"):
       self.handle_bookmark()
     elif getattr(starpilot_toggles, f"force_coast_via_{key}"):
       self.force_coast = not self.force_coast
+    elif getattr(starpilot_toggles, f"pulse_and_glide_via_{key}"):
+      if getattr(sm["carControl"], "longActive", False) or self.pulse_and_glide:
+        self.pulse_and_glide = not self.pulse_and_glide
+        return True
     elif getattr(starpilot_toggles, f"pause_lateral_via_{key}"):
       self.pause_lateral = not self.pause_lateral
     elif getattr(starpilot_toggles, f"pause_longitudinal_via_{key}"):
@@ -102,6 +134,57 @@ class StarPilotCard:
   def handle_bookmark(self):
     counter = self.params_memory.get_int("WheelButtonBookmarkCounter")
     self.params_memory.put_int("WheelButtonBookmarkCounter", counter + 1)
+
+  def _get_controller_action_counter(self, key):
+    try:
+      return self.params_memory.get_int(key)
+    except Exception:
+      return 0
+
+  def _pending_controller_action_count(self, key):
+    counter_key = CONTROLLER_ACTION_COUNTERS[key]
+    current = self._get_controller_action_counter(counter_key)
+    previous = self._controller_action_counters[key]
+    self._controller_action_counters[key] = current
+    return max(0, current - previous)
+
+  def _toggle_controller_aol(self, carState, starpilot_toggles, button_aol_supported):
+    if not button_aol_supported or not getattr(starpilot_toggles, "always_on_lateral", False):
+      return False
+    if self.hyundai_aol_needs_engagement:
+      self.hyundai_aol_ready = True
+    self.always_on_lateral_allowed = not self.always_on_lateral_allowed
+    if carState.cruiseState.enabled or self.pause_lateral:
+      self.pause_lateral = not self.always_on_lateral_allowed
+    return True
+
+  def _handle_controller_actions(self, carState, sm, starpilot_toggles, button_aol_supported):
+    force_coast_count = self._pending_controller_action_count(
+      CONTROLLER_ACTION_FORCE_COAST
+    )
+    if force_coast_count % 2 and getattr(starpilot_toggles, "openpilot_longitudinal", False):
+      self.force_coast = not self.force_coast
+
+    pulse_and_glide_count = self._pending_controller_action_count(
+      CONTROLLER_ACTION_PULSE_AND_GLIDE
+    )
+    if (pulse_and_glide_count % 2 and getattr(starpilot_toggles, "pulse_and_glide_available", False) and
+        (getattr(sm["carControl"], "longActive", False) or self.pulse_and_glide)):
+      self.pulse_and_glide = not self.pulse_and_glide
+
+    aol_count = self._pending_controller_action_count(
+      CONTROLLER_ACTION_TOGGLE_AOL
+    )
+    if aol_count % 2:
+      self._toggle_controller_aol(carState, starpilot_toggles, button_aol_supported)
+
+  def _handle_favorite_traffic_mode_action(self, sm):
+    counter = self.params_memory.get_int(FAVORITE_ACTION_TRAFFIC_MODE_COUNTER)
+    pending = counter - self._favorite_traffic_mode_counter
+    self._favorite_traffic_mode_counter = counter
+
+    if pending > 0 and sm["carControl"].longActive and pending % 2:
+      self.traffic_mode_enabled = not self.traffic_mode_enabled
 
   def handle_experimental_mode(self, sm, starpilot_toggles):
     if getattr(starpilot_toggles, "safe_mode", False):
@@ -122,16 +205,58 @@ class StarPilotCard:
 
   def update(self, carState, starpilotCarState, sm, starpilot_toggles):
     self.switchback_mode_enabled = self.params_memory.get_bool("SwitchbackModeEnabled")
+    self._handle_favorite_traffic_mode_action(sm)
+
+    pulse_glide_cancel_override = (
+      (bool(getattr(sm["carControl"], "longActive", False)) or self.pulse_and_glide) and
+      any(
+        getattr(starpilot_toggles, f"pulse_and_glide_via_cancel{suffix}", False)
+        for suffix in ("", "_long", "_very_long")
+      )
+    )
+    cancel_pressed = bool(getattr(starpilotCarState, "cancelPressed", False))
+    if pulse_glide_cancel_override:
+      carState.buttonEvents = [
+        be for be in carState.buttonEvents
+        if not (
+          self._button_type_raw(be) == int(ButtonType.cancel) and
+          (be.pressed or self.cancel_pulse_glide_suppressed)
+        )
+      ]
+
+    lkas_pressed = any(
+      self._button_type_raw(be) == int(ButtonType.lkas) and be.pressed
+      for be in carState.buttonEvents
+    )
+    pulse_glide_lkas_override = (
+      (bool(getattr(sm["carControl"], "longActive", False)) or self.pulse_and_glide) and
+      getattr(starpilot_toggles, "pulse_and_glide_via_lkas", False)
+    )
+    if pulse_glide_lkas_override:
+      carState.buttonEvents = [
+        be for be in carState.buttonEvents
+        if self._button_type_raw(be) != int(ButtonType.lkas)
+      ]
+
     button_event_types = [self._button_type_raw(be) for be in carState.buttonEvents]
-    button_aol_supported = self.CP.brand == "hyundai" or starpilot_toggles.lkas_allowed_for_aol
+    button_aol_supported = self.always_on_lateral_supported and (
+      self.CP.brand == "hyundai" or starpilot_toggles.lkas_allowed_for_aol
+    )
+    if getattr(self.CP, "carFingerprint", None) == HYUNDAI_CAR.HYUNDAI_SONATA_HYBRID:
+      button_aol_supported = self.always_on_lateral_supported and bool(starpilot_toggles.lkas_allowed_for_aol)
     button_managed_aol = starpilot_toggles.always_on_lateral_lkas or (button_aol_supported and starpilot_toggles.main_cruise_aol_toggle)
-    hyundai_main_cruise_aol_managed = self.CP.brand == "hyundai" and starpilot_toggles.main_cruise_aol_toggle
+    g70_main_cruise_aol_managed = (
+      getattr(self.CP, "carFingerprint", None) == HYUNDAI_CAR.GENESIS_G70_2020
+      and starpilot_toggles.main_cruise_aol_toggle
+    )
 
-    if carState.gearShifter in NON_DRIVING_GEARS or not hyundai_main_cruise_aol_managed:
-      self.main_cruise_aol_pending = False
-      self.main_cruise_aol_pending_frames = 0
+    if carState.gearShifter in NON_DRIVING_GEARS or not g70_main_cruise_aol_managed:
+      self.g70_main_cruise_aol_pending = False
+      self.g70_main_cruise_aol_pending_frames = 0
 
-    if self.hyundai_aol_needs_engagement:
+    hyundai_aol_needs_engagement = self.hyundai_aol_needs_engagement and not starpilot_toggles.always_on_lateral_lkas
+
+    if hyundai_aol_needs_engagement:
       if carState.gearShifter in NON_DRIVING_GEARS:
         preserve_reverse_latch = self.hyundai_preserve_aol_across_reverse and carState.gearShifter == GearShifter.reverse
         if not preserve_reverse_latch:
@@ -143,37 +268,43 @@ class StarPilotCard:
     if button_aol_supported:
       for be, be_type in zip(carState.buttonEvents, button_event_types, strict=False):
         if be_type == ButtonType.lkas and be.pressed and starpilot_toggles.always_on_lateral_lkas:
-          self.main_cruise_aol_pending = False
-          self.main_cruise_aol_pending_frames = 0
-          if self.hyundai_aol_needs_engagement:
+          if hyundai_aol_needs_engagement:
             self.hyundai_aol_ready = True
           self.always_on_lateral_allowed = not self.always_on_lateral_allowed
           if carState.cruiseState.enabled or self.pause_lateral:
             self.pause_lateral = not self.always_on_lateral_allowed
         elif be_type == ButtonType.mainCruise and be.pressed:
           if starpilot_toggles.main_cruise_aol_toggle:
-            if self.hyundai_aol_needs_engagement:
+            if hyundai_aol_needs_engagement:
               self.hyundai_aol_ready = True
-            if hyundai_main_cruise_aol_managed:
-              # Panda permits Hyundai main-button AOL only after the vehicle reports main on.
-              self.main_cruise_aol_pending = True
-              self.main_cruise_aol_pending_frames = 0
+            if g70_main_cruise_aol_managed:
+              # The G70 reports the main-cruise transition after the button press.
+              # Wait for that state change before sending active LKAS11 torque.
+              self.g70_main_cruise_aol_pending = True
+              self.g70_main_cruise_aol_pending_frames = 0
             else:
               self.always_on_lateral_allowed = not self.always_on_lateral_allowed
           elif starpilot_toggles.main_cruise_slc_adopt and starpilot_toggles.speed_limit_controller:
             self.params_memory.put_bool("SLCAdoptSpeedLimit", True)
 
     cruise_available_changed = self.prev_cruise_available is not None and carState.cruiseState.available != self.prev_cruise_available
-    if self.main_cruise_aol_pending:
+    ford_lateral_session_started = self.CP.brand == "ford" and (
+      (cruise_available_changed and carState.cruiseState.available) or
+      (carState.cruiseState.enabled and not self.prev_cruise_enabled)
+    )
+    if ford_lateral_session_started:
+      self.pause_lateral = False
+
+    if self.g70_main_cruise_aol_pending:
       if cruise_available_changed:
         self.always_on_lateral_allowed = carState.cruiseState.available
-        self.main_cruise_aol_pending = False
-        self.main_cruise_aol_pending_frames = 0
+        self.g70_main_cruise_aol_pending = False
+        self.g70_main_cruise_aol_pending_frames = 0
       else:
-        self.main_cruise_aol_pending_frames += 1
-        if self.main_cruise_aol_pending_frames >= HYUNDAI_MAIN_CRUISE_AOL_CONFIRM_TIMEOUT_FRAMES:
-          self.main_cruise_aol_pending = False
-          self.main_cruise_aol_pending_frames = 0
+        self.g70_main_cruise_aol_pending_frames += 1
+        if self.g70_main_cruise_aol_pending_frames >= HYUNDAI_MAIN_CRUISE_AOL_CONFIRM_TIMEOUT_FRAMES:
+          self.g70_main_cruise_aol_pending = False
+          self.g70_main_cruise_aol_pending_frames = 0
 
     if starpilot_toggles.always_on_lateral_main and not button_managed_aol:
       car_fingerprint = getattr(self.CP, "carFingerprint", None)
@@ -191,25 +322,26 @@ class StarPilotCard:
     # On rising edge of engagement (SET press enabling lat+long), auto-enable AOL
     # so that lateral persists when braking disengages longitudinal
     if sm["selfdriveState"].active and not self.prev_active and self.always_on_lateral_set and starpilot_toggles.always_on_lateral_lkas:
-      self.main_cruise_aol_pending = False
-      self.main_cruise_aol_pending_frames = 0
-      if self.hyundai_aol_needs_engagement:
+      if hyundai_aol_needs_engagement:
         self.hyundai_aol_ready = True
       self.always_on_lateral_allowed = True
 
     self.prev_active = sm["selfdriveState"].active
-    self.prev_cruise_available = carState.cruiseState.available
     self.prev_cruise_enabled = carState.cruiseState.enabled
+    self.prev_cruise_available = carState.cruiseState.available
+
+    if not self.always_on_lateral_supported:
+      self.always_on_lateral_allowed = False
 
     self.always_on_lateral_enabled = self.always_on_lateral_allowed and self.always_on_lateral_set
     self.always_on_lateral_enabled &= carState.gearShifter not in NON_DRIVING_GEARS
-    self.always_on_lateral_enabled &= not self.hyundai_aol_needs_engagement or self.hyundai_aol_ready
+    self.always_on_lateral_enabled &= not hyundai_aol_needs_engagement or self.hyundai_aol_ready
     self.always_on_lateral_enabled &= sm["starpilotPlan"].lateralCheck
     self.always_on_lateral_enabled &= sm["liveCalibration"].calPerc >= 1
     alert_types = sm["selfdriveState"].alertType + sm["starpilotSelfdriveState"].alertType
-    self.always_on_lateral_enabled &= ET.IMMEDIATE_DISABLE not in alert_types or self.frogs_go_moo
+    self.always_on_lateral_enabled &= ET.IMMEDIATE_DISABLE not in alert_types
     self.always_on_lateral_enabled &= not (carState.brakePressed and carState.vEgo < starpilot_toggles.always_on_lateral_pause_speed) or carState.standstill
-    self.always_on_lateral_enabled &= not self.error_log.is_file() or self.frogs_go_moo
+    self.always_on_lateral_enabled &= not self.error_log.is_file()
 
     if sm.updated["starpilotPlan"] or any(be_type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be_type in button_event_types):
       self.accel_pressed = any(be_type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be_type in button_event_types)
@@ -228,6 +360,18 @@ class StarPilotCard:
     elif not self.distancePressed_previously:
       self.gap_counter = 0
 
+    distance_released = not starpilotCarState.distancePressed and self.distancePressed_previously
+    has_distance_release = any(
+      self._button_type_raw(be) == int(ButtonType.gapAdjustCruise) and not be.pressed
+      for be in carState.buttonEvents
+    )
+    if getattr(self.CP, "carFingerprint", None) == HYUNDAI_CAR.HYUNDAI_ELANTRA_HEV_2024 and \
+        distance_released and not has_distance_release:
+      carState.buttonEvents = [
+        *carState.buttonEvents,
+        structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise),
+      ]
+
     self.distancePressed_previously = starpilotCarState.distancePressed
 
     if not starpilotCarState.distancePressed and 1 <= self.gap_counter < self.long_press_threshold:
@@ -235,10 +379,8 @@ class StarPilotCard:
     elif self.gap_counter == self.long_press_threshold:
       self.handle_button_event("distance_long", sm, starpilot_toggles)
     elif self.gap_counter == self.very_long_press_threshold:
-      self.handle_button_event("distance_long", sm, starpilot_toggles)
       self.handle_button_event("distance_very_long", sm, starpilot_toggles)
 
-    cancel_pressed = bool(getattr(starpilotCarState, "cancelPressed", False))
     if cancel_pressed:
       self.cancel_counter += 1
     elif not self.cancelPressed_previously:
@@ -246,16 +388,33 @@ class StarPilotCard:
 
     self.cancelPressed_previously = cancel_pressed
 
-    if not cancel_pressed and 1 <= self.cancel_counter < self.long_press_threshold:
-      self.handle_button_event("cancel", sm, starpilot_toggles)
+    pulse_glide_cancel_consumed = False
+    if not cancel_pressed and self.cancel_pulse_glide_suppressed:
+      pass
+    elif not cancel_pressed and 1 <= self.cancel_counter < self.long_press_threshold:
+      pulse_glide_cancel_consumed = self.handle_button_event("cancel", sm, starpilot_toggles) or False
     elif self.cancel_counter == self.long_press_threshold:
-      self.handle_button_event("cancel_long", sm, starpilot_toggles)
+      pulse_glide_cancel_consumed = self.handle_button_event("cancel_long", sm, starpilot_toggles) or False
     elif self.cancel_counter == self.very_long_press_threshold:
-      self.handle_button_event("cancel_long", sm, starpilot_toggles)
-      self.handle_button_event("cancel_very_long", sm, starpilot_toggles)
+      pulse_glide_cancel_consumed = self.handle_button_event("cancel_very_long", sm, starpilot_toggles) or False
 
-    if any(be.pressed and be_type == ButtonType.lkas for be, be_type in zip(carState.buttonEvents, button_event_types, strict=False)):
-      self.handle_button_event("lkas", sm, starpilot_toggles)
+    if pulse_glide_cancel_consumed:
+      self.cancel_pulse_glide_suppressed = True
+      carState.buttonEvents = [
+        be for be in carState.buttonEvents
+        if self._button_type_raw(be) != int(ButtonType.cancel)
+      ]
+    elif not cancel_pressed and self.cancel_pulse_glide_suppressed:
+      self.cancel_pulse_glide_suppressed = False
+
+    if lkas_pressed:
+      if self.CP.brand != "ford" or carState.cruiseState.available:
+        if self.CP.brand == "ford" and getattr(starpilot_toggles, "ford_lkas_aol_toggle", False):
+          self.pause_lateral = not self.pause_lateral
+        else:
+          self.handle_button_event("lkas", sm, starpilot_toggles)
+
+    self._handle_controller_actions(carState, sm, starpilot_toggles, button_aol_supported)
 
     if getattr(starpilot_toggles, "has_canfd_media_buttons", False):
       if starpilotCarState.modePressed:
@@ -269,7 +428,6 @@ class StarPilotCard:
       elif self.mode_counter == self.long_press_threshold:
         self.handle_button_event("mode_long", sm, starpilot_toggles)
       elif self.mode_counter == self.very_long_press_threshold:
-        self.handle_button_event("mode_long", sm, starpilot_toggles)
         self.handle_button_event("mode_very_long", sm, starpilot_toggles)
 
       if starpilotCarState.customPressed:
@@ -283,9 +441,10 @@ class StarPilotCard:
       elif self.custom_counter == self.long_press_threshold:
         self.handle_button_event("star_long", sm, starpilot_toggles)
       elif self.custom_counter == self.very_long_press_threshold:
-        self.handle_button_event("star_long", sm, starpilot_toggles)
         self.handle_button_event("star_very_long", sm, starpilot_toggles)
 
+    if not getattr(starpilot_toggles, "pulse_and_glide_available", False):
+      self.pulse_and_glide = False
     self.force_coast &= not (carState.brakePressed or carState.gasPressed)
 
     starpilotCarState.accelPressed = self.accel_pressed
@@ -297,6 +456,7 @@ class StarPilotCard:
     starpilotCarState.distanceLongPressed = self.very_long_press_threshold > self.gap_counter >= self.long_press_threshold
     starpilotCarState.distanceVeryLongPressed = self.gap_counter >= self.very_long_press_threshold
     starpilotCarState.forceCoast = self.force_coast
+    starpilotCarState.pulseAndGlide = self.pulse_and_glide
     starpilotCarState.isParked = carState.gearShifter == GearShifter.park
     starpilotCarState.pauseLateral = self.pause_lateral
     starpilotCarState.pauseLongitudinal = self.pause_longitudinal

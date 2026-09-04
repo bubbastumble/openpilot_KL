@@ -14,7 +14,7 @@ def _draw_poly_outline(cx: float, cy: float, sides: int, radius: float, rotation
     rl.draw_line_ex(p1, p2, thickness, color)
 
 def render_stopping_point(renderer, font):
-  params = ui_state.params
+  params = ui_state.ui_params
   if not params.get_bool("ShowStoppingPoint"):
     return
 
@@ -22,11 +22,10 @@ def render_stopping_point(renderer, font):
   if not plan or not plan.redLight:
     return
 
-  model = ui_state.sm["modelV2"] if ui_state.sm.valid.get("modelV2", False) else None
-  if not model or not len(model.position.x):
-    return
-
-  stopping_distance = model.position.x[min(32, len(model.position.x) - 1)]
+  # Get calibrated stopping distance from controls planner (aligned with Aethergauge)
+  stopping_distance = getattr(plan, "forcingStopLength", 0.0)
+  if ui_state.sm.valid.get("carState", False) and ui_state.sm["carState"].standstill:
+    stopping_distance = 0.0
 
   # Get the end of the projected path on the screen
   projected = renderer._path.projected_points

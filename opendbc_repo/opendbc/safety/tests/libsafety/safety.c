@@ -103,6 +103,14 @@ bool get_acc_main_on(void){
   return acc_main_on;
 }
 
+bool get_aol_allowed(void){
+  return aol_allowed;
+}
+
+bool get_lkas_on(void){
+  return lkas_on;
+}
+
 float get_vehicle_speed_min(void){
   return vehicle_speed.min / VEHICLE_SPEED_FACTOR;
 }
@@ -176,6 +184,27 @@ int get_angle_meas_min(void){
 
 int get_angle_meas_max(void){
   return angle_meas.max;
+}
+
+void set_desired_curvature_last(int t){
+  curvature_state.desired_last = t;
+}
+
+int get_desired_curvature_last(void){
+  return curvature_state.desired_last;
+}
+
+void set_curvature_meas(int min, int max){
+  curvature_state.meas.min = min;
+  curvature_state.meas.max = max;
+}
+
+int get_curvature_meas_min(void){
+  return curvature_state.meas.min;
+}
+
+int get_curvature_meas_max(void){
+  return curvature_state.meas.max;
 }
 
 

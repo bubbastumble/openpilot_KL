@@ -6,6 +6,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsDashboard
+from openpilot.selfdrive.ui.widgets.home_info_card import HomeInfoCard
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.selfdrive.ui.lib.starpilot_version import starpilot_display_description
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -31,7 +32,7 @@ class HomeLayoutState(IntEnum):
 class HomeLayout(Widget):
   def __init__(self):
     super().__init__()
-    self.params = ui_state.params
+    self.params = ui_state.ui_params
 
     self.update_alert = UpdateAlert()
     self.offroad_alert = OffroadAlert()
@@ -58,12 +59,14 @@ class HomeLayout(Widget):
 
     self._drive_stats = DriveStatsDashboard(self.params)
     self._setup_widget = SetupWidget()
+    self._home_info_card = self._child(HomeInfoCard(params=self.params, drive_stats=self._drive_stats))
 
     self._exp_mode_button = ExperimentalModeButton()
     self._setup_callbacks()
 
   def show_event(self):
     self._exp_mode_button.show_event()
+    super().show_event()
     self.last_refresh = time.monotonic()
     self._refresh()
 
@@ -178,12 +181,31 @@ class HomeLayout(Widget):
 
     version_rect = rl.Rectangle(self.header_rect.x + self.header_rect.width - version_text_width, self.header_rect.y,
                                 version_text_width, self.header_rect.height)
+    brand_text = "StarPilot"
+    detail_text = self._version_text.removeprefix(brand_text)
+    brand_font = gui_app.font(FontWeight.BRAND)
     version_font_size = 48
-    version_text_size = measure_text_cached(font, self._version_text, version_font_size)
-    if version_text_size.x > version_rect.width:
-      version_font_size = max(32, int(version_font_size * version_rect.width / version_text_size.x))
-    gui_label(version_rect, self._version_text, version_font_size, rl.WHITE, font_weight=FontWeight.MEDIUM,
-              alignment=rl.GuiTextAlignment.TEXT_ALIGN_RIGHT)
+
+    def _measure_header(font_size: int) -> tuple[rl.Vector2, rl.Vector2]:
+      return (measure_text_cached(brand_font, brand_text, font_size + 2),
+              measure_text_cached(font, detail_text, font_size))
+
+    brand_size, detail_size = _measure_header(version_font_size)
+    total_width = brand_size.x + detail_size.x
+    if total_width > version_rect.width:
+      version_font_size = max(32, int(version_font_size * version_rect.width / total_width))
+      brand_size, detail_size = _measure_header(version_font_size)
+      total_width = brand_size.x + detail_size.x
+
+    rendered_width = min(total_width, version_rect.width)
+    text_x = version_rect.x + version_rect.width - rendered_width
+    brand_rect = rl.Rectangle(text_x, version_rect.y, min(brand_size.x, rendered_width), version_rect.height)
+    gui_label(brand_rect, brand_text, version_font_size + 2, rl.WHITE, font_weight=FontWeight.BRAND, elide_right=False)
+
+    detail_width = max(0.0, rendered_width - brand_rect.width)
+    if detail_text and detail_width > 0:
+      detail_rect = rl.Rectangle(brand_rect.x + brand_rect.width, version_rect.y, detail_width, version_rect.height)
+      gui_label(detail_rect, detail_text, version_font_size, rl.WHITE, font_weight=FontWeight.MEDIUM)
 
   def _render_home_content(self):
     self._render_left_column()
@@ -212,12 +234,13 @@ class HomeLayout(Widget):
       self.right_column_rect.height - exp_height - SPACING,
     )
     if ui_state.prime_state.is_paired():
-      self._drive_stats.render_records(setup_rect)
+      self._home_info_card.render(setup_rect)
     else:
       self._setup_widget.render(setup_rect)
 
   def _refresh(self):
     self._drive_stats.refresh()
+    self._home_info_card.refresh()
     self._version_text = self._get_version_text()
     update_available = self.update_alert.refresh()
     alert_count = self.offroad_alert.refresh()

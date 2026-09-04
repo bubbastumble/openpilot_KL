@@ -12,14 +12,22 @@ from starpilot.system.speed_limit_vision import DetectorProposal, HistoryEntry, 
 class MemoryParams:
   def __init__(self):
     self.values = {}
+    self.write_count = 0
 
   def put_float(self, key, value):
+    self.write_count += 1
     self.values[key] = value
 
   def put_int(self, key, value):
+    self.write_count += 1
+    self.values[key] = value
+
+  def put(self, key, value):
+    self.write_count += 1
     self.values[key] = value
 
   def remove(self, key):
+    self.write_count += 1
     self.values.pop(key, None)
 
 
@@ -65,6 +73,70 @@ def publishing_daemon(is_metric):
   daemon._schedule_auto_bookmark = lambda *_args, **_kwargs: None
   daemon._publish_status = lambda status, **_kwargs: setattr(daemon, "published_status", status)
   return daemon
+
+
+def test_debug_storage_failure_does_not_crash_detection(monkeypatch):
+  class ReadOnlyPath:
+    def __truediv__(self, _part):
+      return self
+
+    def exists(self):
+      return False
+
+    def mkdir(self, **_kwargs):
+      raise OSError(30, "Read-only file system")
+
+  daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  daemon.use_runtime = True
+  daemon.params_memory = MemoryParams()
+  daemon.debug_session_id = ""
+  daemon.debug_session_unavailable = False
+  monkeypatch.setattr(slv, "DEBUG_BASE_DIR", ReadOnlyPath())
+
+  assert not daemon._start_debug_session()
+  assert daemon.debug_session_unavailable
+  assert daemon.debug_session_id == ""
+  assert daemon.params_memory.values["VisionSpeedLimitLastEvent"] == "debug storage unavailable: OSError"
+
+  assert not daemon._start_debug_session()
+
+
+@pytest.mark.skipif(not hasattr(slv, "memory_pressure_level"), reason="host runtime predates memory pressure governor")
+@pytest.mark.parametrize(
+  ("available_kb", "usage_percent", "expected"),
+  (
+    (None, None, "normal"),
+    (512 * 1024 + 1, None, "normal"),
+    (512 * 1024, None, "pressure"),
+    (256 * 1024, None, "critical"),
+    (None, 88, "pressure"),
+    (None, 94, "critical"),
+  ),
+)
+def test_memory_pressure_level(available_kb, usage_percent, expected):
+  assert slv.memory_pressure_level(available_kb, usage_percent) == expected
+
+
+def test_inference_interval_backs_off_after_expensive_inference():
+  daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  daemon.followup_until = 0.0
+  daemon.last_live_pose_inputs_not_ok_at = -float("inf")
+  daemon.last_frame_process_duration_s = 0.4
+  daemon.memory_pressure_state = "normal"
+  daemon.coexistence_mode = False
+  daemon.last_cpu_busy = False
+  daemon._update_memory_pressure = lambda: "normal"
+  daemon._device_cpu_busy = lambda: False
+
+  interval = daemon._inference_interval(10.0)
+
+  assert interval == pytest.approx(1.0)
+  assert daemon.last_inference_interval_reason == "processing_cost"
+
+
+def test_runtime_loop_represents_exact_normal_cadences():
+  assert slv.RUNTIME_LOOP_HZ * slv.INFERENCE_INTERVAL == pytest.approx(5.0)
+  assert slv.RUNTIME_LOOP_HZ * slv.FOLLOWUP_INFERENCE_INTERVAL == pytest.approx(3.0)
 
 
 def test_disconnect_camera_releases_client_state():
@@ -164,6 +236,30 @@ def test_receive_frame_does_not_retain_vision_buffer(monkeypatch):
 
   assert frame.shape == (3, 2)
   assert buffer_refs[0]() is None
+
+
+def test_publish_status_only_writes_changed_values():
+  daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  daemon.params_memory = MemoryParams()
+  daemon.stream_name = "road camera"
+  daemon.last_logged_status = ""
+  daemon.last_published_stream = None
+  daemon._write_debug_event = lambda *_args, **_kwargs: None
+
+  daemon._publish_status("Scanning road camera")
+  assert daemon.params_memory.write_count == 2
+
+  daemon._publish_status("Scanning road camera")
+  assert daemon.params_memory.write_count == 2
+
+  daemon.stream_name = "wide camera"
+  daemon._publish_status("Scanning road camera")
+  assert daemon.params_memory.write_count == 3
+  assert daemon.params_memory.values["VisionSpeedLimitStream"] == "wide camera"
+
+  daemon._publish_status("Holding 45 mph")
+  assert daemon.params_memory.write_count == 4
+  assert daemon.params_memory.values["VisionSpeedLimitStatus"] == "Holding 45 mph"
 
 
 def test_published_sign_value_uses_configured_units():

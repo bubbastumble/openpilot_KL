@@ -8,7 +8,7 @@ from opendbc.car.common.filter_simple import FirstOrderFilter
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.toyota.values import ToyotaFlags, ToyotaStarPilotFlags, CAR, DBC, STEER_THRESHOLD, NO_STOP_TIMER_CAR, \
                                                   TSS2_CAR, RADAR_ACC_CAR, EPS_SCALE, UNSUPPORTED_DSU_CAR, \
-                                                  SECOC_CAR
+                                                  SECOC_CAR, LEGACY_PRIUS_CAR
 
 ButtonType = structs.CarState.ButtonEvent.Type
 SteerControlType = structs.CarParams.SteerControlType
@@ -23,7 +23,8 @@ TEMP_STEER_FAULTS = (0, 9, 11, 21, 25)
 # - lka/lta msg drop out: 3 (recoverable)
 # - prolonged high driver torque: 17 (permanent)
 PERM_STEER_FAULTS = (3, 17)
-LKAS_BUTTON_CAR = TSS2_CAR | {CAR.TOYOTA_PRIUS}
+LKAS_BUTTON_CAR = TSS2_CAR | LEGACY_PRIUS_CAR
+DISTANCE_BUTTON_CAR = {CAR.TOYOTA_SIENNA_4TH_GEN}
 
 
 # Traffic signals for Speed Limit Controller - Credit goes to the DragonPilot team!
@@ -160,12 +161,14 @@ class CarState(CarStateBase):
     ret.steeringPressed = abs(ret.steeringTorque) > STEER_THRESHOLD
 
     # Check EPS LKA/LTA fault status
-    ret.steerFaultTemporary = cp.vl["EPS_STATUS"]["LKA_STATE"] in TEMP_STEER_FAULTS
-    ret.steerFaultPermanent = cp.vl["EPS_STATUS"]["LKA_STATE"] in PERM_STEER_FAULTS
+    # A missing EPS_STATUS frame reads as zero in the parser. Do not turn that
+    # invalid startup sample into a real steering fault.
+    ret.steerFaultTemporary = cp.can_valid and cp.vl["EPS_STATUS"]["LKA_STATE"] in TEMP_STEER_FAULTS
+    ret.steerFaultPermanent = cp.can_valid and cp.vl["EPS_STATUS"]["LKA_STATE"] in PERM_STEER_FAULTS
 
     if self.CP.steerControlType == SteerControlType.angle:
-      ret.steerFaultTemporary = ret.steerFaultTemporary or cp.vl["EPS_STATUS"]["LTA_STATE"] in TEMP_STEER_FAULTS
-      ret.steerFaultPermanent = ret.steerFaultPermanent or cp.vl["EPS_STATUS"]["LTA_STATE"] in PERM_STEER_FAULTS
+      ret.steerFaultTemporary = cp.can_valid and (ret.steerFaultTemporary or cp.vl["EPS_STATUS"]["LTA_STATE"] in TEMP_STEER_FAULTS)
+      ret.steerFaultPermanent = cp.can_valid and (ret.steerFaultPermanent or cp.vl["EPS_STATUS"]["LTA_STATE"] in PERM_STEER_FAULTS)
 
       # Lane Tracing Assist control is unavailable (EPS_STATUS->LTA_STATE=0) until
       # the more accurate angle sensor signal is initialized
@@ -242,6 +245,16 @@ class CarState(CarStateBase):
 
         buttonEvents += create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise})
 
+    if self.CP.carFingerprint in LEGACY_PRIUS_CAR and not self.has_SDSU:
+      prev_distance_button = self.distance_button
+      self.distance_button = cp_acc.vl["ACC_CONTROL"]["DISTANCE"]
+      buttonEvents += create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise})
+
+    if self.CP.carFingerprint in DISTANCE_BUTTON_CAR:
+      prev_distance_button = self.distance_button
+      self.distance_button = cp.vl["PCM_CRUISE_4"]["DISTANCE"]
+      buttonEvents += create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise})
+
     fp_ret = custom.StarPilotCarState.new_message()
 
     if self.has_SDSU and not self.has_can_filter:
@@ -286,11 +299,20 @@ class CarState(CarStateBase):
     pt_messages = [
       ("BLINKERS_STATE", float('nan')),
     ]
+    cam_messages = []
 
     if CP.enableGasInterceptorDEPRECATED:
       pt_messages.append(("GAS_SENSOR", 50))
 
+    if CP.carFingerprint in LEGACY_PRIUS_CAR:
+      pt_messages.append(("ACC_CONTROL", float('nan')))
+      if CP.flags & ToyotaFlags.DSU_BYPASS.value:
+        cam_messages.append(("ACC_CONTROL", float('nan')))
+
+    if CP.carFingerprint in DISTANCE_BUTTON_CAR:
+      pt_messages.append(("PCM_CRUISE_4", 1))
+
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, 0),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, 2),
     }

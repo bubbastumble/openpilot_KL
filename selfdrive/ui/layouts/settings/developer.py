@@ -1,3 +1,4 @@
+from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.ssh_key import ssh_key_item
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
@@ -7,7 +8,6 @@ from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
-
 
 # Description constants
 DESCRIPTIONS = {
@@ -25,17 +25,13 @@ DESCRIPTIONS = {
     "Enable this to switch to openpilot longitudinal control. Enabling Experimental mode is recommended when enabling openpilot longitudinal control alpha. " +
     "Changing this setting will restart openpilot if the car is powered on."
   ),
-  'use_prebuilt': tr_noop(
-    "When enabled (default), openpilot uses prebuilt binaries at startup and skips source compilation. " +
-    "Disable this if you intend to edit code and compile directly on-device."
-  ),
 }
 
 
 class DeveloperLayout(Widget):
   def __init__(self):
     super().__init__()
-    self._params = ui_state.params
+    self._params = Params()
 
     # Build items and keep references for callbacks/state updates
     self._adb_toggle = toggle_item(
@@ -43,14 +39,6 @@ class DeveloperLayout(Widget):
       description=lambda: tr(DESCRIPTIONS["enable_adb"]),
       initial_state=self._params.get_bool("AdbEnabled"),
       callback=self._on_enable_adb,
-      enabled=ui_state.is_offroad,
-    )
-
-    self._use_prebuilt_toggle = toggle_item(
-      lambda: tr("Use Prebuilt Binaries"),
-      description=lambda: tr(DESCRIPTIONS["use_prebuilt"]),
-      initial_state=self._params.get_bool("UsePrebuilt"),
-      callback=self._on_use_prebuilt,
       enabled=ui_state.is_offroad,
     )
 
@@ -96,7 +84,6 @@ class DeveloperLayout(Widget):
 
     self._scroller = Scroller([
       self._adb_toggle,
-      self._use_prebuilt_toggle,
       self._ssh_toggle,
       self._ssh_keys,
       self._joystick_toggle,
@@ -140,7 +127,6 @@ class DeveloperLayout(Widget):
     # refresh toggles from params to mirror external changes
     for key, item in (
       ("AdbEnabled", self._adb_toggle),
-      ("UsePrebuilt", self._use_prebuilt_toggle),
       ("SshEnabled", self._ssh_toggle),
       ("JoystickDebugMode", self._joystick_toggle),
       ("LongitudinalManeuverMode", self._long_maneuver_toggle),
@@ -159,9 +145,6 @@ class DeveloperLayout(Widget):
 
   def _on_enable_ssh(self, state: bool):
     self._params.put_bool("SshEnabled", state)
-
-  def _on_use_prebuilt(self, state: bool):
-    self._params.put_bool("UsePrebuilt", state)
 
   def _on_joystick_debug_mode(self, state: bool):
     self._params.put_bool("JoystickDebugMode", state)

@@ -207,7 +207,7 @@ class CAR(Platforms):
     dbc_dict('toyota_new_mc_pt_generated', 'toyota_adas'),
   )
   TOYOTA_MATRIX_RETROFIT = PlatformConfig(
-    [ToyotaCommunityCarDocs("Toyota Matrix 2005 Retrofit", package="Custom retrofit")],
+    [ToyotaCommunityCarDocs("Toyota Matrix Retrofit 2005", package="Custom retrofit")],
     TOYOTA_COROLLA.specs,
     dbc_dict('toyota_new_mc_pt_generated', 'toyota_adas'),
   )
@@ -248,6 +248,11 @@ class CAR(Platforms):
       ToyotaCarDocs("Toyota Prius Prime 2017-20", video="https://www.youtube.com/watch?v=8zopPJI8XQ0"),
     ],
     CarSpecs(mass=3045. * CV.LB_TO_KG, wheelbase=2.7, steerRatio=15.74, tireStiffnessFactor=0.6371),
+    dbc_dict('toyota_nodsu_pt_generated', 'toyota_adas'),
+  )
+  TOYOTA_PRIUS_RETROFIT = PlatformConfig(
+    [ToyotaCommunityCarDocs("Toyota Prius 2016-20 with TSS2 EPS retrofit", package="Custom retrofit")],
+    TOYOTA_PRIUS.specs,
     dbc_dict('toyota_nodsu_pt_generated', 'toyota_adas'),
   )
   TOYOTA_PRIUS_V = PlatformConfig(
@@ -324,7 +329,7 @@ class CAR(Platforms):
     flags=ToyotaFlags.NO_STOP_TIMER,
   )
   TOYOTA_SIENNA_4TH_GEN = ToyotaSecOCPlatformConfig(
-    [ToyotaCommunityCarDocs("Toyota Sienna 2021-23", min_enable_speed=MIN_ACC_SPEED)],
+    [ToyotaCommunityCarDocs("Toyota Sienna 2021-25", min_enable_speed=MIN_ACC_SPEED)],
     CarSpecs(mass=4625. * CV.LB_TO_KG, wheelbase=3.06, steerRatio=17.8, tireStiffnessFactor=0.444),
   )
 
@@ -599,8 +604,10 @@ STEER_THRESHOLD = 100
 
 # These cars have non-standard EPS torque scale factors. All others are 73
 EPS_SCALE = defaultdict(lambda: 73,
-                        {CAR.TOYOTA_PRIUS: 66, CAR.TOYOTA_COROLLA: 88, CAR.TOYOTA_MATRIX_RETROFIT: 88,
+                        {CAR.TOYOTA_PRIUS: 66, CAR.TOYOTA_PRIUS_RETROFIT: 73, CAR.TOYOTA_COROLLA: 88, CAR.TOYOTA_MATRIX_RETROFIT: 88,
                          CAR.LEXUS_IS: 77, CAR.LEXUS_RC: 77, CAR.LEXUS_CTH: 100, CAR.TOYOTA_PRIUS_V: 100})
+
+LEGACY_PRIUS_CAR = frozenset((CAR.TOYOTA_PRIUS, CAR.TOYOTA_PRIUS_RETROFIT))
 
 # Toyota/Lexus Safety Sense 2.0 and 2.5
 TSS2_CAR = CAR.with_flags(ToyotaFlags.TSS2)

@@ -14,14 +14,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "scripts") not in sys.path:
   sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from model_compiler import split_oversized_artifact
+from model_compiler import REPOSITORY_FILE_LIMIT, split_oversized_artifact
 
 DEFAULT_OPENPILOT = Path.home() / "openpilot"
-DEFAULT_WORKSPACE = Path("/Volumes/T5/StarPilot-Model-Rebuild-2026-06-22")
-DEFAULT_SOURCE_MAP = REPO_ROOT / "scripts/model_source_map_v22.json"
-DEFAULT_MANIFEST = DEFAULT_WORKSPACE / "manifests/model_names_v22.json"
-REMOTE = "comma@192.168.3.110"
+DEFAULT_WORKSPACE = Path("/Volumes/T5/StarPilot-Model-Rebuild")
+DEFAULT_SOURCE_MAP = REPO_ROOT / "scripts/model_source_map_v25.json"
+DEFAULT_MANIFEST = DEFAULT_WORKSPACE / "manifests/model_names_v25.json"
+REMOTE = os.environ.get("STAR_PILOT_MODEL_REMOTE", "comma@192.168.3.110")
 REMOTE_ROOT = Path("/data/openpilot")
+SSH_OPTIONS = ("-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1")
 
 MODEL_FILENAMES = (
   "driving_supercombo.onnx",
@@ -100,7 +101,17 @@ def resolve_lfs(repo: Path, pointer_path: Path, ref: str, git_path: str) -> None
   oid, expected_size = pointer
   object_path = git_object_path(repo, oid)
   if not object_path.is_file():
-    run(["git", "-C", str(repo), "lfs", "fetch", "origin", ref, "--include", git_path])
+    fetch_refs = [ref]
+    if not ref.startswith("refs/"):
+      fetch_refs.extend((f"refs/remotes/origin/{ref}", f"refs/heads/{ref}"))
+    for fetch_ref in fetch_refs:
+      result = subprocess.run(
+        ["git", "-C", str(repo), "lfs", "fetch", "origin", fetch_ref, "--include", git_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+      )
+      if result.returncode == 0 and object_path.is_file():
+        break
   if not object_path.is_file():
     raise FileNotFoundError(f"Missing LFS object {oid} for {ref}:{git_path}")
   if object_path.stat().st_size != expected_size or sha256_file(object_path) != oid:
@@ -138,9 +149,9 @@ def extract_git_file(repo: Path, ref: str, git_path: str, destination: Path) -> 
   temporary.replace(destination)
 
 
-def find_model_paths(repo: Path, ref: str, input_format: str) -> list[str]:
+def find_model_paths(repo: Path, ref: str, input_format: str, uses_external_gpu: bool = False) -> list[str]:
   requested = (
-    ("driving_supercombo.onnx",)
+    (("big_driving_supercombo.onnx",) if uses_external_gpu else ("driving_supercombo.onnx",))
     if input_format == "supercombo"
     else (
       "driving_vision.onnx",
@@ -175,7 +186,7 @@ def extract_model(model_id: str, source: dict, repo: Path, workspace: Path) -> d
   output_dir = workspace / "onnx" / model_id
   output_dir.mkdir(parents=True, exist_ok=True)
   extracted = []
-  for git_path in find_model_paths(repo, ref, input_format):
+  for git_path in find_model_paths(repo, ref, input_format, bool(source.get("uses_external_gpu"))):
     filename = Path(git_path).name
     destination = output_dir / f"{model_id}_{filename}"
     extract_git_file(repo, ref, git_path, destination)
@@ -198,7 +209,7 @@ def extract_model(model_id: str, source: dict, repo: Path, workspace: Path) -> d
 
 def remote(command: str, *, capture: bool = False):
   result = subprocess.run(
-    ["ssh", REMOTE, command],
+    ["ssh", *SSH_OPTIONS, REMOTE, command],
     check=False,
     text=capture,
     capture_output=capture,
@@ -211,14 +222,50 @@ def remote(command: str, *, capture: bool = False):
 
 def stage_ready_artifact(artifact: Path, workspace: Path) -> None:
   ready_path = workspace / "ready-for-resources" / artifact.name
-  multipart_outputs = split_oversized_artifact(artifact, ready_path.parent)
-  if multipart_outputs:
-    ready_path.unlink(missing_ok=True)
-    for multipart_output in multipart_outputs:
-      multipart_output.chmod(0o644)
-  else:
-    shutil.copyfile(artifact, ready_path)
-    ready_path.chmod(0o644)
+  chunked_outputs = split_oversized_artifact(artifact, ready_path.parent, force=True)
+  ready_path.unlink(missing_ok=True)
+  for chunked_output in chunked_outputs:
+    chunked_output.chmod(0o644)
+
+
+def pull_remote_artifact(remote_output: str, local_output: Path) -> None:
+  """Pull a single artifact or native chunks and reconstruct the T5 archive copy."""
+  local_output.unlink(missing_ok=True)
+  for stale in local_output.parent.glob(f"{local_output.name}.p[0-9][0-9]"):
+    stale.unlink()
+  for stale in local_output.parent.glob(f"{local_output.name}.chunk[0-9][0-9]of[0-9][0-9]"):
+    stale.unlink()
+  local_output.parent.joinpath(f"{local_output.name}.chunkmanifest").unlink(missing_ok=True)
+  local_output.parent.joinpath(f"{local_output.name}.sha256").unlink(missing_ok=True)
+  local_output.parent.mkdir(parents=True, exist_ok=True)
+  run(["rsync", "-az", "-e", "ssh -o ConnectTimeout=10 -o ConnectionAttempts=1", f"{REMOTE}:{remote_output}*", f"{local_output.parent}/"])
+
+  parts = sorted(local_output.parent.glob(f"{local_output.name}.chunk[0-9][0-9]of[0-9][0-9]"))
+  if local_output.is_file():
+    for part in parts:
+      part.unlink()
+    local_output.parent.joinpath(f"{local_output.name}.chunkmanifest").unlink(missing_ok=True)
+    local_output.parent.joinpath(f"{local_output.name}.sha256").unlink(missing_ok=True)
+    return
+  checksum_path = local_output.parent / f"{local_output.name}.sha256"
+  chunk_manifest = local_output.parent / f"{local_output.name}.chunkmanifest"
+  if not parts or not checksum_path.is_file() or not chunk_manifest.is_file():
+    raise FileNotFoundError(f"Remote compiler returned neither {local_output.name} nor verified native chunks")
+  if int(chunk_manifest.read_text().strip()) != len(parts):
+    raise ValueError(f"Native chunk count mismatch for {local_output.name}")
+  with open(local_output, "wb") as destination:
+    for part in parts:
+      with open(part, "rb") as source:
+        shutil.copyfileobj(source, destination, length=1024 * 1024)
+  expected = checksum_path.read_text().split()[0]
+  actual = sha256_file(local_output)
+  if actual != expected:
+    local_output.unlink(missing_ok=True)
+    raise ValueError(f"Reassembled {local_output.name} checksum mismatch: {actual} != {expected}")
+  for part in parts:
+    part.unlink()
+  chunk_manifest.unlink()
+  checksum_path.unlink()
 
 
 def compile_model(model_id: str, source: dict, version: str, workspace: Path, force: bool) -> dict:
@@ -233,7 +280,7 @@ def compile_model(model_id: str, source: dict, version: str, workspace: Path, fo
   remote_input = f"{REMOTE_ROOT}/uncompiledmodels/{model_id}"
   remote_output = f"{REMOTE_ROOT}/compiledmodels/{model_id}_driving_tinygrad.pkl"
   remote(f"rm -rf {remote_input} && mkdir -p {remote_input} {REMOTE_ROOT}/compiledmodels")
-  run(["rsync", "-az", "--exclude=._*", f"{source_dir}/", f"{REMOTE}:{remote_input}/"])
+  run(["rsync", "-az", "-e", "ssh -o ConnectTimeout=10 -o ConnectionAttempts=1", "--exclude=._*", f"{source_dir}/", f"{REMOTE}:{remote_input}/"])
 
   log_path = workspace / "logs" / f"{model_id}.log"
   command_parts = [
@@ -245,11 +292,11 @@ def compile_model(model_id: str, source: dict, version: str, workspace: Path, fo
     command_parts.append("--external-gpu")
   command = " ".join(command_parts)
   with open(log_path, "wb") as log_file:
-    process = subprocess.run(["ssh", REMOTE, command], stdout=log_file, stderr=subprocess.STDOUT)
+    process = subprocess.run(["ssh", *SSH_OPTIONS, REMOTE, command], stdout=log_file, stderr=subprocess.STDOUT)
   if process.returncode != 0:
     raise RuntimeError(f"Compilation failed for {model_id}; see {log_path}")
 
-  run(["rsync", "-az", f"{REMOTE}:{remote_output}", str(local_output)])
+  pull_remote_artifact(remote_output, local_output)
   local_output.chmod(0o644)
   stage_ready_artifact(local_output, workspace)
   result = artifact_result(model_id, local_output, "compiled")
@@ -264,7 +311,7 @@ def artifact_result(model_id: str, path: Path, status: str) -> dict:
     "path": str(path),
     "size": path.stat().st_size,
     "sha256": sha256_file(path),
-    "multipart": path.stat().st_size > 100 * 1024 * 1024,
+    "chunk_count": len(list((path.parent.parent / "ready-for-resources").glob(f"{path.name}.chunk[0-9][0-9]of[0-9][0-9]"))),
   }
 
 
@@ -272,10 +319,11 @@ def validate_model(model_id: str, version: str, workspace: Path) -> dict:
   artifact = workspace / "compiled" / f"{model_id}_driving_tinygrad.pkl"
   if not artifact.is_file():
     raise FileNotFoundError(artifact)
-  run(["rsync", "-az", str(artifact), f"{REMOTE}:/data/models/{artifact.name}"])
+  run(["rsync", "-az", "-e", "ssh -o ConnectTimeout=10 -o ConnectionAttempts=1", str(artifact), f"{REMOTE}:/data/models/{artifact.name}"])
   run([
     "rsync",
     "-az",
+    "-e", "ssh -o ConnectTimeout=10 -o ConnectionAttempts=1",
     str(REPO_ROOT / "scripts/validate_model_artifact.py"),
     f"{REMOTE}:{REMOTE_ROOT}/scripts/validate_model_artifact.py",
   ])
@@ -294,16 +342,7 @@ def validate_model(model_id: str, version: str, workspace: Path) -> dict:
 def update_manifest(base_manifest: Path, workspace: Path, source_map: dict) -> dict:
   payload = load_json(base_manifest)
   models = payload["models"] if isinstance(payload, dict) else payload
-  if not any(model.get("id") == "deeprl3v2" for model in models):
-    models.append({
-      "id": "deeprl3v2",
-      "name": "Deep RL 3 V2 👀📡",
-      "version": "v15",
-      "series": "OP Series",
-      "released": "2026-06-17",
-      "community_favorite": False,
-    })
-  multipart_handoff = []
+  build_results = []
   for model in models:
     source = source_map.get(model["id"], {})
     if "uses_external_gpu" in source:
@@ -313,25 +352,30 @@ def update_manifest(base_manifest: Path, workspace: Path, source_map: dict) -> d
     model.pop("artifact_size", None)
     model.pop("artifact_sha256", None)
     model.pop("artifact_urls", None)
-    if not artifact.is_file() or artifact.stat().st_size <= 100 * 1024 * 1024:
+    model.pop("artifact_chunk_count", None)
+    if not artifact.is_file():
       model.pop("artifact_url", None)
-    else:
-      multipart_handoff.append({
+      continue
+    chunks = sorted((workspace / "ready-for-resources").glob(f"{artifact.name}.chunk[0-9][0-9]of[0-9][0-9]"))
+    model.update({
+      "artifact_format": "tinygrad_single_v1",
+      "artifact_size": artifact.stat().st_size,
+      "artifact_sha256": sha256_file(artifact),
+      "artifact_chunk_count": len(chunks),
+    })
+    build_results.append({
         "id": model["id"],
         "filename": artifact.name,
         "size": artifact.stat().st_size,
         "sha256": sha256_file(artifact),
-        "parts": [
-          path.name
-          for path in sorted((workspace / "ready-for-resources").glob(f"{artifact.name}.p[0-9][0-9]"))
-        ],
+        "chunks": [path.name for path in chunks],
       })
   output = {"models": models}
-  output_path = workspace / "manifests/model_names_v22.json"
+  output_path = workspace / "manifests/model_names_v25.json"
   output_path.parent.mkdir(parents=True, exist_ok=True)
   output_path.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
-  (workspace / "ready-for-resources" / "multipart.json").write_text(
-    json.dumps(multipart_handoff, indent=2) + "\n",
+  (workspace / "ready-for-resources" / "artifacts.json").write_text(
+    json.dumps(build_results, indent=2) + "\n",
   )
   return output
 

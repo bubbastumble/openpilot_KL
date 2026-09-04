@@ -5,12 +5,14 @@ import re
 import urllib.request
 
 from pathlib import Path
+from urllib.parse import quote
 
 from openpilot.starpilot.assets.download_functions import (
-  GITLAB_URL,
+  delete_chunked_artifact,
+  download_chunked_file,
   download_file,
   download_multipart_file,
-  get_repository_url,
+  get_resource_urls,
   handle_error,
   handle_request_error,
   verify_download,
@@ -22,19 +24,31 @@ from openpilot.starpilot.common.model_versions import (
 )
 from openpilot.starpilot.common.starpilot_utilities import delete_file
 from openpilot.starpilot.common.starpilot_variables import MODELS_PATH
+from openpilot.common.file_chunker import file_chunked_exists, get_existing_chunks, get_manifest_path
+from openpilot.system.hardware.usb import chestnut_firmware_ready
 
-MANIFEST_CANDIDATES = ("v22",)
-DEFAULT_MODEL_KEY = "sc2"
+MANIFEST_CANDIDATES = ("v25",)
+MODEL_NAMESPACE_SUFFIX = "3"
+DEFAULT_MODEL_KEY = "rdf43"
+LOCAL_MODEL_PREFIX = "local-"
+LOCAL_MODEL_SERIES = "Local Series"
 ARTIFACT_URLS_CACHE = ".model_artifact_urls.json"
 ARTIFACT_METADATA_CACHE = ".model_artifacts.json"
 MODEL_KEY_CANONICAL_MAP = {
-  "sc": DEFAULT_MODEL_KEY,
+  "sc": "sc2",
+  # The original bundled RDF key remains valid after the bundled default moves
+  # to the v23 RDF V4 artifact.
+  "rdf": DEFAULT_MODEL_KEY,
 }
+LEGACY_DRIVING_PREFIXES = (
+  "driving_",
+)
 
 CANCEL_DOWNLOAD_PARAM = "CancelModelDownload"
 DOWNLOAD_PROGRESS_PARAM = "ModelDownloadProgress"
 MODEL_DOWNLOAD_PARAM = "ModelToDownload"
 MODEL_DOWNLOAD_ALL_PARAM = "DownloadAllModels"
+ALLOW_GPU_DOWNLOAD_WITHOUT_GPU_PARAM = "AllowGpuModelDownloadWithoutGpu"
 UPDATE_TINYGRAD_PARAM = "UpdateTinygrad"
 
 
@@ -49,6 +63,16 @@ def canonical_model_key(model_key: str) -> str:
 
 def is_builtin_model_key(model_key: str) -> bool:
   return canonical_model_key(model_key) == DEFAULT_MODEL_KEY
+
+
+def is_local_model_key(model_key: str) -> bool:
+  """Hand-installed models live outside the manifest and are never downloaded or pruned."""
+  return canonical_model_key(model_key).startswith(LOCAL_MODEL_PREFIX)
+
+
+def is_driving_artifact_file(filename: str) -> bool:
+  """Match both namespaced unified artifacts and pre-v23 split driving files."""
+  return "_driving_" in filename or filename.startswith(LEGACY_DRIVING_PREFIXES)
 
 
 def model_key_aliases(model_key: str) -> list[str]:
@@ -79,6 +103,14 @@ def load_model_artifact_metadata(model_key: str) -> dict:
 
 def model_uses_external_gpu(model_key: str) -> bool:
   return bool(load_model_artifact_metadata(model_key).get("uses_external_gpu", False))
+
+
+def external_gpu_available() -> bool:
+  """Return whether the supported external GPU link is ready for modeld."""
+  try:
+    return bool(chestnut_firmware_ready())
+  except Exception:
+    return False
 
 
 class ModelManager:
@@ -154,10 +186,7 @@ class ModelManager:
 
   @staticmethod
   def _manifest_paths(manifest_version: str) -> tuple[str, ...]:
-    return (
-      f"Versions/model_names_{manifest_version}.json",
-      f"model_names_{manifest_version}.json",
-    )
+    return (f"Models/model_names_{manifest_version}.json",)
 
   def _set_model_param_keys(self, model_key: str | None = None, model_name: str | None = None, model_version: str | None = None):
     if model_key is not None and model_key != "":
@@ -174,7 +203,7 @@ class ModelManager:
     selected_model = self._selected_model()
     current_version = self._resolve_mirrored_param("ModelVersion", "DrivingModelVersion")
     if not current_version:
-      current_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or "v11"
+      current_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or ("v15" if is_builtin_model_key(selected_model) else "v11")
 
     selected_name = self._param_text("DrivingModelName")
     if not selected_name and selected_model in self.available_models:
@@ -200,6 +229,18 @@ class ModelManager:
       for index, model_key in enumerate(self.available_models)
       if index < len(self.artifact_formats) and model_key
     }
+
+  def _resolve_manifest_model_key(self, model_key: str) -> str:
+    """Resolve an old manifest ID to its namespaced v23 replacement."""
+    canonical_key = self._canonical_model_key(model_key)
+    if canonical_key in self.available_models or is_builtin_model_key(canonical_key):
+      return canonical_key
+
+    for alias in self._model_key_aliases(canonical_key):
+      candidate = f"{alias}{MODEL_NAMESPACE_SUFFIX}"
+      if candidate in self.available_models:
+        return candidate
+    return canonical_key
 
   def _blacklisted_model_keys(self) -> set[str]:
     return {
@@ -301,8 +342,10 @@ class ModelManager:
         continue
       metadata[model_key] = {
         "artifact_format": artifact_format,
+        "artifact_filename": str(model.get("artifact_filename") or "").strip(),
         "artifact_size": int(model.get("artifact_size") or 0),
         "artifact_sha256": str(model.get("artifact_sha256") or "").strip().lower(),
+        "artifact_chunk_count": int(model.get("artifact_chunk_count") or 0),
         "artifact_url": str(model.get("artifact_url") or model.get("download_url") or "").strip(),
         "uses_external_gpu": bool(model.get("uses_external_gpu", False)),
       }
@@ -327,10 +370,18 @@ class ModelManager:
     metadata = self._load_artifact_metadata_map().get(self._canonical_model_key(model_key), {})
     for filename in required_files:
       path = MODELS_PATH / filename
-      if not path.is_file():
+      if not file_chunked_exists(path):
         return False
       expected_size = int(metadata.get("artifact_size") or 0)
-      if expected_size and path.stat().st_size != expected_size:
+      try:
+        paths = get_existing_chunks(path)
+      except (OSError, ValueError):
+        return False
+      if paths and paths[0] == get_manifest_path(path):
+        paths = paths[1:]
+      if not paths or any(not Path(part).is_file() for part in paths):
+        return False
+      if expected_size and sum(Path(part).stat().st_size for part in paths) != expected_size:
         return False
     return True
 
@@ -349,10 +400,12 @@ class ModelManager:
       canonical_key = self._canonical_model_key(model_key)
       if canonical_key in blacklisted_keys or canonical_key in seen_keys:
         continue
+      if model_uses_external_gpu(canonical_key) and not external_gpu_available():
+        continue
 
       model_version = version_map.get(model_key) or version_map.get(canonical_key) or ""
       if not model_version and is_builtin_model_key(canonical_key):
-        model_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or "v11"
+        model_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or "v15"
 
       artifact_format = artifact_format_map.get(model_key) or artifact_format_map.get(canonical_key) or ""
       if not self._is_model_downloaded(model_key, artifact_format):
@@ -408,7 +461,7 @@ class ModelManager:
 
     fallback_version = self._resolve_mirrored_param("ModelVersion", "DrivingModelVersion")
     if not fallback_version:
-      fallback_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or "v11"
+      fallback_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or ("v15" if is_builtin_model_key(selected) else "v11")
     self._set_model_param_keys(selected, name_map.get(selected, ""), fallback_version)
 
   @staticmethod
@@ -421,29 +474,57 @@ class ModelManager:
       handle_request_error(error, None, None, None, None)
       return []
 
-  def _get_manifest(self, repo_url: str) -> tuple[str | None, list[dict]]:
+  @staticmethod
+  def _is_huggingface_url(url: str) -> bool:
+    return "huggingface.co/buckets/" in url
+
+  @staticmethod
+  def _hf_manifest_paths(manifest_version: str) -> tuple[str, ...]:
+    return (f"manifests/model_names_{manifest_version}.json",)
+
+  @classmethod
+  def _artifact_source_urls(cls, resource_url: str, manifest_version: str, model_key: str, filename: str) -> tuple[str, ...]:
+    model_key = quote(cls._canonical_model_key(model_key), safe="")
+    manifest_version = quote(manifest_version, safe="")
+    filename = quote(filename, safe="")
+    if cls._is_huggingface_url(resource_url):
+      return (f"{resource_url}/models/{manifest_version}/{model_key}/{filename}",)
+    return (f"{resource_url}/Models/{manifest_version}/{model_key}/{filename}",)
+
+  def _get_manifest(self, resource_urls: str | list[str]) -> tuple[str | None, list[dict]]:
+    if isinstance(resource_urls, str):
+      resource_urls = [resource_urls]
+
     for manifest_version in MANIFEST_CANDIDATES:
-      for manifest_path in self._manifest_paths(manifest_version):
-        model_info = self._fetch_manifest(f"{repo_url}/{manifest_path}")
-        if not model_info:
-          continue
+      for resource_url in resource_urls:
+        manifest_paths = (
+          self._hf_manifest_paths(manifest_version)
+          if self._is_huggingface_url(resource_url)
+          else self._manifest_paths(manifest_version)
+        )
+        for manifest_path in manifest_paths:
+          model_info = self._fetch_manifest(f"{resource_url}/{manifest_path}")
+          if not model_info:
+            continue
 
-        filtered = [
-          model for model in model_info
-          if is_supported_artifact_format(model.get("artifact_format"))
-        ]
-        if not filtered:
-          continue
+          filtered = [
+            model for model in model_info
+            if is_supported_artifact_format(model.get("artifact_format"))
+          ]
+          if not filtered:
+            continue
 
-        return manifest_version, filtered
+          return manifest_version, filtered
 
     return None, []
 
   def _remove_stale_model_files(self):
     valid_keys = set(self.available_models)
-    for model_file in MODELS_PATH.glob("*_driving_*"):
-      model_key = model_file.name.split("_driving_", 1)[0]
-      if model_key not in valid_keys:
+    for model_file in MODELS_PATH.iterdir():
+      if not model_file.is_file() or not is_driving_artifact_file(model_file.name):
+        continue
+      model_key = model_file.name.split("_driving_", 1)[0] if "_driving_" in model_file.name else ""
+      if not model_key or not is_local_model_key(model_key) and model_key not in valid_keys:
         delete_file(model_file, print_error=False)
 
     for temp_file in MODELS_PATH.glob("tmp*"):
@@ -454,6 +535,24 @@ class ModelManager:
       return
 
     selected = self._selected_model()
+    if model_uses_external_gpu(selected) and not external_gpu_available():
+      default_name = self._default_param_text("DrivingModelName") or "Regret Driven Framework V4"
+      default_version = self._default_param_text("ModelVersion") or self._default_param_text("DrivingModelVersion") or "v15"
+      self._set_model_param_keys(DEFAULT_MODEL_KEY, default_name, default_version)
+      print(f"Model {selected} requires an external GPU; selected built-in model instead.")
+      return
+
+    if is_builtin_model_key(selected):
+      self._sync_selected_model_version()
+      return
+
+    resolved_selected = self._resolve_manifest_model_key(selected)
+    if resolved_selected != selected:
+      selected_index = self.available_models.index(resolved_selected)
+      selected_name = self.available_model_names[selected_index] if selected_index < len(self.available_model_names) else resolved_selected
+      self._set_model_param_keys(resolved_selected, selected_name, None)
+      selected = resolved_selected
+
     aliases = self._model_key_aliases(selected)
     if any(alias in self.available_models for alias in aliases):
       self._sync_selected_model_version()
@@ -472,7 +571,52 @@ class ModelManager:
     self._set_model_param_keys(replacement, replacement_name, None)
     self._sync_selected_model_version()
 
+  def _discover_local_models(self) -> list[dict]:
+    """Synthesize manifest entries for hand-installed models found in MODELS_PATH.
+
+    A local model is any "<local-*>_driving_*" artifact. An optional "<id>.json"
+    sidecar supplies name/version/series; without one the version stays empty so
+    modeld falls back to the version embedded in the artifact itself.
+    """
+    try:
+      entries = sorted(MODELS_PATH.glob(f"{LOCAL_MODEL_PREFIX}*_driving_*"))
+    except Exception as error:
+      print(f"Failed to scan for local models: {error}")
+      return []
+
+    discovered: dict[str, dict] = {}
+    for model_file in entries:
+      model_key = model_file.name.split("_driving_", 1)[0]
+      # Keys and names land in comma-joined params, so a comma would corrupt the catalog.
+      if not model_key.startswith(LOCAL_MODEL_PREFIX) or "," in model_key or model_key in discovered:
+        continue
+
+      info: dict = {}
+      sidecar = MODELS_PATH / f"{model_key}.json"
+      if sidecar.is_file():
+        try:
+          loaded = json.loads(sidecar.read_text())
+          if isinstance(loaded, dict):
+            info = loaded
+        except Exception as error:
+          print(f"Ignoring malformed local model sidecar {sidecar.name}: {error}")
+
+      fallback_name = model_key[len(LOCAL_MODEL_PREFIX):].replace("_", " ").replace("-", " ").strip()
+      discovered[model_key] = {
+        "id": model_key,
+        "name": _clean_model_name(info.get("name") or fallback_name or model_key).replace(",", " "),
+        "version": str(info.get("version") or "").strip(),
+        "series": str(info.get("series") or LOCAL_MODEL_SERIES).strip().replace(",", " "),
+        "released": str(info.get("released") or "2100-01-01").strip(),
+        "community_favorite": False,
+        "artifact_format": UNIFIED_ARTIFACT_FORMAT,
+        "uses_external_gpu": bool(info.get("uses_external_gpu", False)),
+      }
+
+    return list(discovered.values())
+
   def update_model_params(self, model_info: list[dict], manifest_version: str):
+    model_info = list(model_info) + self._discover_local_models()
     self.available_models = [str(model.get("id") or "").strip() for model in model_info]
     self.available_model_names = [_clean_model_name(model.get("name")) for model in model_info]
     self.model_versions = [str(model.get("version") or "").strip() for model in model_info]
@@ -513,21 +657,32 @@ class ModelManager:
     self._remove_stale_model_files()
     self._enforce_selected_model()
 
-  def _migrate_to_unified_artifacts(self, selected_model: str):
+  def _migrate_model_artifacts(self, selected_model: str):
+    """Remove artifacts compiled for the previous tinygrad manifest.
+
+    Model IDs are stable across manifest generations, but tinygrad pickles are
+    not. Local models are intentionally retained because StarPilot does not own
+    or have a source from which to redownload them.
+    """
     removed = 0
-    for model_file in MODELS_PATH.glob("*_driving_*"):
+    for model_file in MODELS_PATH.iterdir():
+      if not model_file.is_file() or not is_driving_artifact_file(model_file.name):
+        continue
+      model_key = model_file.name.split("_driving_", 1)[0] if "_driving_" in model_file.name else ""
+      if model_key and is_local_model_key(model_key):
+        continue
       if model_file.is_file() or model_file.is_symlink():
         delete_file(model_file, print_error=False)
         removed += 1
     if removed:
-      print(f"Removed {removed} incompatible pre-v22 model artifacts.")
+      print(f"Removed {removed} incompatible model artifacts during tinygrad manifest migration.")
 
     if selected_model and not is_builtin_model_key(selected_model):
       self.params_memory.put(DOWNLOAD_PROGRESS_PARAM, f"Downloading selected model \"{selected_model}\"...")
       self.download_model(selected_model)
       selected_format = self._model_artifact_format_map().get(selected_model, "")
       selected_files = self._required_files(selected_model, selected_format)
-      if not selected_files or not all((MODELS_PATH / filename).is_file() for filename in selected_files):
+      if not selected_files or not all(file_chunked_exists(MODELS_PATH / filename) for filename in selected_files):
         default_index = next(
           (index for index, key in enumerate(self.available_models) if is_builtin_model_key(key)),
           None,
@@ -535,12 +690,12 @@ class ModelManager:
         default_name = (
           self.available_model_names[default_index]
           if default_index is not None and default_index < len(self.available_model_names)
-          else "South Carolina"
+          else "Regret Driven Framework V4"
         )
         default_version = (
           self.model_versions[default_index]
           if default_index is not None and default_index < len(self.model_versions)
-          else "v11"
+          else "v15"
         )
         self._set_model_param_keys(DEFAULT_MODEL_KEY, default_name, default_version)
         self.params_memory.put(DOWNLOAD_PROGRESS_PARAM, "Selected model unavailable; using built-in model.")
@@ -549,12 +704,12 @@ class ModelManager:
     if self.downloading_model:
       return
 
-    repo_url = get_repository_url()
-    if repo_url is None:
-      print("GitHub and GitLab are offline...")
+    resource_urls = get_resource_urls()
+    if not resource_urls:
+      print("Hugging Face and GitHub are offline...")
       return
 
-    manifest_version, model_info = self._get_manifest(repo_url)
+    manifest_version, model_info = self._get_manifest(resource_urls)
     if not model_info:
       print("No compatible tinygrad manifest found.")
       return
@@ -563,11 +718,25 @@ class ModelManager:
     previous_manifest = self._param_text("ModelManifestVersion")
     resolved_manifest = manifest_version or "unknown"
     self.update_model_params(model_info, resolved_manifest)
+    migrated_model = self._resolve_manifest_model_key(selected_model)
+    if migrated_model != selected_model:
+      migrated_index = self.available_models.index(migrated_model)
+      migrated_name = self.available_model_names[migrated_index] if migrated_index < len(self.available_model_names) else migrated_model
+      migrated_version = self.model_versions[migrated_index] if migrated_index < len(self.model_versions) else ""
+      self._set_model_param_keys(migrated_model, migrated_name, migrated_version)
+      selected_model = migrated_model
     if previous_manifest != resolved_manifest:
-      self._migrate_to_unified_artifacts(selected_model)
+      self._migrate_model_artifacts(selected_model)
     self.check_models(boot_run)
 
   def download_model(self, model_to_download: str):
+    allow_gpu_without_gpu = self.params_memory.get_bool(ALLOW_GPU_DOWNLOAD_WITHOUT_GPU_PARAM)
+    try:
+      self._download_model(model_to_download, allow_gpu_without_gpu)
+    finally:
+      self.params_memory.remove(ALLOW_GPU_DOWNLOAD_WITHOUT_GPU_PARAM)
+
+  def _download_model(self, model_to_download: str, allow_gpu_without_gpu: bool):
     self.downloading_model = True
 
     if is_builtin_model_key(model_to_download):
@@ -576,9 +745,22 @@ class ModelManager:
       self.downloading_model = False
       return
 
-    repo_url = get_repository_url()
-    if not repo_url:
-      handle_error(None, "GitHub and GitLab are offline...", "Repository unavailable", MODEL_DOWNLOAD_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
+    if model_uses_external_gpu(model_to_download) and not external_gpu_available() and not allow_gpu_without_gpu:
+      handle_error(None, "External GPU required...", "This model requires a detected external GPU.", MODEL_DOWNLOAD_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
+      self.downloading_model = False
+      return
+
+    # Local models have no upstream URL; a download attempt would 404 and then
+    # delete_file() the artifact on verification failure.
+    if is_local_model_key(model_to_download):
+      self.params_memory.put(DOWNLOAD_PROGRESS_PARAM, "Local model, nothing to download.")
+      self.params_memory.remove(MODEL_DOWNLOAD_PARAM)
+      self.downloading_model = False
+      return
+
+    resource_urls = get_resource_urls()
+    if not resource_urls:
+      handle_error(None, "Hugging Face and GitHub are offline...", "Repository unavailable", MODEL_DOWNLOAD_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
       self.downloading_model = False
       return
 
@@ -599,21 +781,35 @@ class ModelManager:
 
     for filename in required_files:
       file_path = MODELS_PATH / filename
+      remote_filename = str(artifact_metadata.get("artifact_filename") or filename).strip()
+      manifest_version = self._param_text("ModelManifestVersion") or MANIFEST_CANDIDATES[0]
       candidate_urls: list[tuple[str, bool, bool]] = []
 
-      custom_url = artifact_urls.get(filename, "").strip()
+      custom_url = (artifact_urls.get(filename) or artifact_urls.get(remote_filename) or artifact_metadata.get("artifact_url") or "").strip()
       if custom_url:
         candidate_urls.append((custom_url, True, False))
 
-      file_url = f"{repo_url}/Models/{filename}"
-      candidate_urls.append((file_url, False, True))
-
-      fallback_url = f"{GITLAB_URL}/Models/{filename}"
-      if fallback_url != file_url:
-        candidate_urls.append((fallback_url, False, True))
+      for resource_url in resource_urls:
+        for artifact_url in self._artifact_source_urls(resource_url, manifest_version, model_to_download, remote_filename):
+          if not any(existing[0] == artifact_url for existing in candidate_urls):
+            candidate_urls.append((artifact_url, False, True))
 
       download_succeeded = False
       for candidate_url, allow_unknown_size, allow_multipart in candidate_urls:
+        chunk_count = int(artifact_metadata.get("artifact_chunk_count") or 0)
+        if chunk_count and download_chunked_file(
+          CANCEL_DOWNLOAD_PARAM,
+          file_path,
+          DOWNLOAD_PROGRESS_PARAM,
+          candidate_url,
+          self.params_memory,
+          expected_size=artifact_metadata.get("artifact_size"),
+          expected_sha256=artifact_metadata.get("artifact_sha256"),
+          expected_chunk_count=chunk_count,
+        ):
+          download_succeeded = True
+          break
+
         download_file(
           CANCEL_DOWNLOAD_PARAM,
           file_path,
@@ -640,6 +836,16 @@ class ModelManager:
           break
         delete_file(file_path, print_error=False)
 
+        if not chunk_count and download_chunked_file(
+          CANCEL_DOWNLOAD_PARAM,
+          file_path,
+          DOWNLOAD_PROGRESS_PARAM,
+          candidate_url,
+          self.params_memory,
+        ):
+          download_succeeded = True
+          break
+
         if allow_multipart and download_multipart_file(
           CANCEL_DOWNLOAD_PARAM,
           file_path,
@@ -652,6 +858,7 @@ class ModelManager:
           break
 
       if not download_succeeded:
+        delete_chunked_artifact(file_path)
         handle_error(file_path, "Verification failed...", f"Verification failed for {filename}", MODEL_DOWNLOAD_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
         self.downloading_model = False
         return
@@ -661,12 +868,19 @@ class ModelManager:
     self.downloading_model = False
 
   def download_all_models(self):
-    repo_url = get_repository_url()
-    if not repo_url:
-      handle_error(None, "GitHub and GitLab are offline...", "Repository unavailable", MODEL_DOWNLOAD_ALL_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
+    allow_gpu_without_gpu = self.params_memory.get_bool(ALLOW_GPU_DOWNLOAD_WITHOUT_GPU_PARAM)
+    try:
+      self._download_all_models(allow_gpu_without_gpu)
+    finally:
+      self.params_memory.remove(ALLOW_GPU_DOWNLOAD_WITHOUT_GPU_PARAM)
+
+  def _download_all_models(self, allow_gpu_without_gpu: bool):
+    resource_urls = get_resource_urls()
+    if not resource_urls:
+      handle_error(None, "Hugging Face and GitHub are offline...", "Repository unavailable", MODEL_DOWNLOAD_ALL_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
       return
 
-    manifest_version, model_info = self._get_manifest(repo_url)
+    manifest_version, model_info = self._get_manifest(resource_urls)
     if not model_info:
       handle_error(None, "Unable to fetch models...", "Model list unavailable", MODEL_DOWNLOAD_ALL_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
       return
@@ -679,12 +893,18 @@ class ModelManager:
         handle_error(None, "Download cancelled...", "Download cancelled...", MODEL_DOWNLOAD_ALL_PARAM, DOWNLOAD_PROGRESS_PARAM, self.params_memory)
         return
 
+      if is_local_model_key(model_key):
+        continue
+
+      if model_uses_external_gpu(model_key) and not external_gpu_available() and not allow_gpu_without_gpu:
+        continue
+
       artifact_format = artifact_format_map.get(model_key, "")
       if self._is_model_downloaded(model_key, artifact_format):
         continue
 
       self.params_memory.put(DOWNLOAD_PROGRESS_PARAM, f"Downloading \"{model_name}\"...")
-      self.download_model(model_key)
+      self._download_model(model_key, allow_gpu_without_gpu)
       if self.params_memory.get_bool(CANCEL_DOWNLOAD_PARAM):
         return
 
@@ -696,7 +916,12 @@ class ModelManager:
     # This branch ships tinygrad runtime in-tree. "Update" here refreshes local model files.
     self.params_memory.put(DOWNLOAD_PROGRESS_PARAM, "Updating...")
 
-    for model_file in MODELS_PATH.glob("*_driving_*"):
+    for model_file in MODELS_PATH.iterdir():
+      if not model_file.is_file() or not is_driving_artifact_file(model_file.name):
+        continue
+      model_key = model_file.name.split("_driving_", 1)[0] if "_driving_" in model_file.name else ""
+      if model_key and is_local_model_key(model_key):
+        continue
       if model_file.is_file():
         delete_file(model_file, print_error=False)
 

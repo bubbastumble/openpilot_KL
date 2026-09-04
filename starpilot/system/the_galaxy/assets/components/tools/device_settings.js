@@ -11,10 +11,11 @@ const FAVORITE_OPTION_COLLATOR = new Intl.Collator(undefined, { numeric: true, s
 const FAVORITE_ACTION_PREFIX = "__starpilot_favorite_action__:"
 const GALAXY_DEVELOPER_MODE_KEY = "GalaxyDeveloperMode"
 const HIDDEN_SECTION_NAMES = new Set(["Model & Customization"])
-const HIDDEN_SETTING_KEYS = new Set(["DisableWideRoad", "HumanAcceleration", "ReverseCruise"])
+const HIDDEN_SETTING_KEYS = new Set(["HumanAcceleration"])
 const GM_MAKES = ["Buick", "Cadillac", "Chevrolet", "GMC", "Holden"]
 const HKG_MAKES = ["Genesis", "Hyundai", "Kia"]
 const VEHICLE_SETTING_MAKES = {
+  RivianAngleControl: ["Rivian"],
   TeslaCoopSteering: ["Tesla"],
   NAPRadarEnabled: ["Tesla"],
   NAPRadarBehindNosecone: ["Tesla"],
@@ -38,6 +39,8 @@ const VEHICLE_SETTING_MAKES = {
   JeepBrakeHold: ["Jeep"],
   SubaruSNG: ["Subaru"],
   SubaruSNGManualParkingBrake: ["Subaru"],
+  SubaruStopStartOff: ["Subaru"],
+  SubaruAvhOnAtStartup: ["Subaru"],
   ClusterOffset: ["Lexus", "Toyota"],
   SNGHack: ["Lexus", "Toyota"],
   ToyotaAutoHold: ["Lexus", "Toyota"],
@@ -51,6 +54,8 @@ let flmWorkspaceInflight = null
 let lastFlmWorkspaceFetch = 0
 let favoritePollInflight = null
 let favoritePollTimer = null
+let cscCalibrationPollInflight = null
+let cscCalibrationPollTimer = null
 const DYNAMIC_DEFAULT_DEP_KEYS = new Set(["AccelerationProfile", "EVTuning", "TruckTuning"])
 const PANDA_FIRMWARE_TOGGLE_KEYS = new Set(["IgnoreIgnitionLine", "RemoteStartBootsComma", "HKGRemoteStartBootsComma"])
 const FLM_ADVANCED_LATERAL_KEYS = new Set([
@@ -73,6 +78,7 @@ const state = reactive({
   fetched: false,
   activeSectionSlug: "",
   numericUpdating: {},
+  sliderPreviewValues: {},
   actionUpdating: {},
   favoriteLoading: false,
   favoriteSaving: false,
@@ -94,17 +100,25 @@ function normalizeVehicleMake(value) {
 }
 
 function isVehicleSettingVisible(section, param) {
-  if (section.name !== "Vehicle") return true
-  const allowedMakes = VEHICLE_SETTING_MAKES[param.key]
+  const allowedMakes = param.vehicle_makes || (section.name === "Vehicle" ? VEHICLE_SETTING_MAKES[param.key] : null)
   if (!allowedMakes) return true
   const selectedMake = normalizeVehicleMake(state.values.CarMake)
   return allowedMakes.some(make => normalizeVehicleMake(make) === selectedMake)
 }
 
+function matchesSettingValueCondition(param) {
+  if (!param.visible_when_key) return true
+  const allowedValues = Array.isArray(param.visible_when_values) ? param.visible_when_values : []
+  const currentValue = toSelectValue(state.values[param.visible_when_key])
+  return allowedValues.some(value => toSelectValue(value) === currentValue)
+}
+
 function isSettingVisible(section, param) {
   // This policy controls Galaxy rendering only; hidden params retain their stored values.
-  if (HIDDEN_SETTING_KEYS.has(param.key) || !isVehicleSettingVisible(section, param)) return false
+  if (HIDDEN_SETTING_KEYS.has(param.key) || !isVehicleSettingVisible(section, param) || !matchesSettingValueCondition(param)) return false
+  if (param.requires_capability && !state.values[param.requires_capability]) return false
   if (RADAR_REQUIRED_KEYS.has(param.key) && !state.values.HasRadar) return false
+  if (param.key === "AlphaLongitudinalEnabled" && !state.values.AlphaLongitudinalAvailable) return false
   if (state.values[GALAXY_DEVELOPER_MODE_KEY]) return true
   return section.name === "Favorites" || param.settings_tier === "simple"
 }
@@ -197,6 +211,7 @@ function scheduleSyncInputs() {
 function applySelectOptions(el, options) {
   el.innerHTML = ""
   for (const opt of options || []) {
+    if (opt?.developer_only && !state.values[GALAXY_DEVELOPER_MODE_KEY]) continue
     const o = document.createElement("option")
     o.value = String(opt.value)
     o.textContent = opt.label
@@ -268,6 +283,11 @@ function syncInputs() {
     const param = state.paramMetaByKey[key]
     if (!param) continue
     el.value = resolveColorInputValue(param)
+  }
+
+  for (const el of document.querySelectorAll("input.ds-text-input[id^='ds-']")) {
+    if (document.activeElement === el) continue
+    el.value = toSelectValue(state.values[el.id.slice(3)])
   }
 
   // Sync selects — hydrate options + set value
@@ -438,6 +458,10 @@ function formatSliderValue(val, stepStr, precisionInt, key) {
     return v === 1 ? "1 min" : `${v} min`
   }
 
+  if (key === "DeviceShutdown") {
+    return v === 1 ? "1 hour" : `${v} hours`
+  }
+
   const volumeKeys = [
     "BelowSteerSpeedVolume", "DisengageVolume", "EngageVolume", "PromptVolume",
     "PromptDistractedVolume", "RefuseVolume",
@@ -456,6 +480,16 @@ function formatSliderValue(val, stepStr, precisionInt, key) {
   if (!stepStr || !stepStr.includes(".")) return Math.round(v).toString()
   const dec = stepStr.split(".")[1].length
   return Number(v.toFixed(dec)).toString()
+}
+
+function formatReadoutValue(p) {
+  const raw = state.values[p.key]
+  const value = parseFloat(raw)
+  if (raw === undefined || raw === null || Number.isNaN(value)) return "--"
+
+  const precision = p.precision !== undefined && p.precision !== null ? Number(p.precision) : 2
+  const formatted = Number(value.toFixed(Math.max(0, precision))).toString()
+  return p.unit ? `${formatted}${p.unit}` : formatted
 }
 
 function formatNumericForInput(value, precision) {
@@ -653,6 +687,51 @@ function ensureFavoriteValuePolling() {
   }, 1000)
 }
 
+async function refreshCscCalibrationValues() {
+  if (cscCalibrationPollInflight || state.loadingValues) return cscCalibrationPollInflight
+
+  cscCalibrationPollInflight = Promise.all(
+    ["CalibratedLateralAcceleration", "CalibrationProgress"].map(async key => {
+      const response = await fetch(`/api/params_memory?key=${encodeURIComponent(key)}`, { cache: "no-store" })
+      if (!response.ok) return [key, null]
+      const raw = (await response.text()).trim()
+      const value = Number(raw)
+      return [key, Number.isFinite(value) && raw !== "" ? value : null]
+    }),
+  ).then(entries => {
+    const nextValues = { ...state.values }
+    let changed = false
+    for (const [key, value] of entries) {
+      if (value === null || nextValues[key] === value) continue
+      nextValues[key] = value
+      changed = true
+    }
+    if (changed) {
+      state.values = nextValues
+      scheduleSyncInputs()
+    }
+  }).catch(() => {}).finally(() => {
+    cscCalibrationPollInflight = null
+  })
+
+  return cscCalibrationPollInflight
+}
+
+function ensureCscCalibrationPolling() {
+  if (cscCalibrationPollTimer !== null) return
+
+  cscCalibrationPollTimer = setInterval(() => {
+    if (!window.location.pathname.startsWith("/device_settings")) {
+      clearInterval(cscCalibrationPollTimer)
+      cscCalibrationPollTimer = null
+      return
+    }
+    if (document.visibilityState === "visible") {
+      refreshCscCalibrationValues()
+    }
+  }, 1000)
+}
+
 async function saveFavoriteSlots(slots) {
   if (state.favoriteSaving) return
 
@@ -840,6 +919,16 @@ function getParamDisplayLabel(key) {
   return state.paramMetaByKey[key]?.label || key
 }
 
+function getSliderDescription(param, value) {
+  const steps = Array.isArray(param.description_steps) ? param.description_steps : []
+  if (!steps.length) return param.description || ""
+
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) return param.description || ""
+  const selected = steps.find(step => numericValue <= Number(step.max)) || steps[steps.length - 1]
+  return selected.description || param.description || ""
+}
+
 function confirmPandaFirmwareToggle(key, enabled) {
   if (!PANDA_FIRMWARE_TOGGLE_KEYS.has(key)) return true
 
@@ -870,7 +959,12 @@ function syncNumericDisplay(param, rawValue) {
 
 async function updateNumericParam(param, numericValue, options = {}) {
   const key = param.key
-  const current = state.values[key]
+  const current = options.previousValue !== undefined ? options.previousValue : state.values[key]
+  if (Object.prototype.hasOwnProperty.call(state.sliderPreviewValues, key)) {
+    const nextPreviewValues = { ...state.sliderPreviewValues }
+    delete nextPreviewValues[key]
+    state.sliderPreviewValues = nextPreviewValues
+  }
   const successMessage = options.successMessage
   state.numericUpdating = { ...state.numericUpdating, [key]: true }
   state.values = { ...state.values, [key]: numericValue }
@@ -903,6 +997,40 @@ async function updateNumericParam(param, numericValue, options = {}) {
     syncNumericDisplay(param, current)
     showParamSnackbar("Network error — is the device reachable?", "error")
   }
+}
+
+function previewSliderParam(param, rawValue) {
+  if (isNumericUpdating(param.key)) return
+
+  const bounds = numericBounds(param)
+  const precision = stepPrecision(bounds.step, param.precision)
+  const snapped = snapNumericToBoundsAndStep(rawValue, bounds, precision)
+  if (snapped === null) return
+
+  state.sliderPreviewValues = { ...state.sliderPreviewValues, [param.key]: snapped }
+  syncNumericDisplay(param, snapped)
+}
+
+function commitSliderParam(param, rawValue) {
+  if (isNumericUpdating(param.key)) return
+
+  const bounds = numericBounds(param)
+  const precision = stepPrecision(bounds.step, param.precision)
+  const next = snapNumericToBoundsAndStep(rawValue, bounds, precision)
+  if (next === null) return
+
+  const current = resolveCurrentNumericValue(param, bounds)
+  const previewValues = { ...state.sliderPreviewValues }
+  delete previewValues[param.key]
+  state.sliderPreviewValues = previewValues
+
+  const epsilon = Math.pow(10, -(precision + 2))
+  if (Math.abs(next - current) <= epsilon) {
+    syncNumericDisplay(param, current)
+    return
+  }
+
+  updateNumericParam(param, next, { previousValue: current })
 }
 
 function stepNumericParam(param, direction) {
@@ -1047,6 +1175,11 @@ async function updateParam(key, elType) {
     return
   }
 
+  if (elType === "checkbox" && formattedVal && param.confirm_message && !window.confirm(param.confirm_message)) {
+    revertInput(key, current, elType)
+    return
+  }
+
   try {
     const res = await fetch("/api/params", {
       method: "PUT",
@@ -1177,6 +1310,12 @@ function clearSearchFilter() {
 const cancelButtonKeys = new Set(["CancelButtonControl", "LongCancelButtonControl", "VeryLongCancelButtonControl"])
 
 function getSettingLockReason(param) {
+  if (param?.requires_offroad && state.values.IsOnroad) {
+    return "This setting can only be changed while parked."
+  }
+  if (param?.requires_parked && !state.values.VehicleParked) {
+    return "This setting can only be changed while the vehicle is in Park."
+  }
   if (param?.disabled_when_key_true && state.values[param.disabled_when_key_true]) {
     return param.disabled_reason || "Disabled by another setting."
   }
@@ -1408,8 +1547,11 @@ function renderSettingRow(p) {
   }
 
   const isNumeric = p.ui_type === "numeric"
+  const isSlider = isNumeric && p.control === "slider"
+  const isText = p.ui_type === "text"
   const isColor = p.ui_type === "color"
   const isAction = p.ui_type === "action"
+  const isReadout = p.ui_type === "readout"
   const isGroup = isGroupParam(p)
   const isChild = p.parent_key ? "ds-child-modifier" : ""
   const lockReason = () => getSettingLockReason(p)
@@ -1427,6 +1569,41 @@ function renderSettingRow(p) {
         ${() => state.actionUpdating[p.key] ? "Resetting..." : (p.action_label || "Run")}
       </button>
     `
+  } else if (isSlider) {
+    rowControl = html`
+      <div class="ds-slider-container">
+        <input
+          type="range"
+          class="ds-slider"
+          min="${numericBounds(p).min}"
+          max="${numericBounds(p).max}"
+          step="${numericBounds(p).step}"
+          aria-label="${p.label}"
+          disabled="${() => isLocked() || isNumericUpdating(p.key)}"
+          value="${() => {
+            const bounds = numericBounds(p)
+            const preview = state.sliderPreviewValues[p.key]
+            return formatNumericForInput(preview ?? resolveCurrentNumericValue(p, bounds), stepPrecision(bounds.step, p.precision))
+          }}"
+          @input="${(event) => previewSliderParam(p, event.currentTarget.value)}"
+          @change="${(event) => commitSliderParam(p, event.currentTarget.value)}" />
+        <div class="ds-slider-scale">
+          <span>${formatSliderValue(numericBounds(p).min, String(numericBounds(p).step), p.precision, p.key)}</span>
+          <span>${formatSliderValue(numericBounds(p).max, String(numericBounds(p).step), p.precision, p.key)}</span>
+        </div>
+        <button
+          class="ds-reset-btn"
+          disabled="${() => {
+            const bounds = numericBounds(p)
+            const defaultValue = resolveDefaultNumericValue(p, bounds)
+            const currentValue = resolveCurrentNumericValue(p, bounds)
+            const precision = stepPrecision(bounds.step, p.precision)
+            const epsilon = Math.pow(10, -(precision + 2))
+            return isLocked() || isNumericUpdating(p.key) || defaultValue === null || Math.abs(defaultValue - currentValue) <= epsilon
+          }}"
+          @click="${() => resetNumericParam(p)}">Reset to Default</button>
+      </div>
+    `
   } else if (isNumeric) {
     rowControl = html`
       <div class="ds-stepper-container">
@@ -1443,7 +1620,7 @@ function renderSettingRow(p) {
         ? formatSliderValue(defaultNumeric, String(bounds.step), p.precision, p.key)
         : "N/A"
       const canReset = !updating && defaultNumeric !== null && Math.abs(defaultNumeric - currentNumeric) > epsilon
-      const stepLabel = formatStepValue(bounds.step, precision)
+      const stepLabel = p.key === "DeviceShutdown" ? "1 hour" : formatStepValue(bounds.step, precision)
       return html`
             <div class="ds-stepper">
               <button
@@ -1498,6 +1675,17 @@ function renderSettingRow(p) {
         <option value="">Loading...</option>
       </select>
     `
+  } else if (isText) {
+    rowControl = html`
+      <input
+        type="${p.input_type || "text"}"
+        class="ds-manual-input ds-text-input"
+        id="ds-${p.key}"
+        value="${() => toSelectValue(state.values[p.key])}"
+        placeholder="${p.placeholder || ""}"
+        disabled="${() => isLocked()}"
+        @change="${() => updateParam(p.key, "text")}" />
+    `
   } else if (p.ui_type === "color") {
     rowControl = html`
       <div style="display:flex; align-items:center; gap:0.75rem;">
@@ -1514,7 +1702,7 @@ function renderSettingRow(p) {
           @click="${() => resetColorParam(p)}">Stock</button>
       </div>
     `
-  } else if (!isGroup) {
+  } else if (!isGroup && !isReadout) {
     if (p.key === "IsRHD") {
       rowControl = html`
         <div style="display:flex; align-items:center; gap:0.75rem;">
@@ -1543,14 +1731,16 @@ function renderSettingRow(p) {
   }
 
   return html`
-    <div class="ds-row ${isNumeric ? "ds-row-numeric" : ""} ${isChild}">
+    <div class="ds-row ${isNumeric ? "ds-row-numeric" : ""} ${isText ? "ds-row-text-input" : ""} ${isChild}">
       <div class="ds-row-info">
         <div class="ds-row-text">
           <div class="ds-row-heading">
             <span class="ds-row-label">${p.label}</span>
             ${flmParamStatus ? html`<span class="ds-flm-badge">Currently overridden by FLM</span>` : ""}
           </div>
-          ${p.description ? html`<div class="ds-row-desc">${p.description}</div>` : ""}
+          ${p.description_steps
+            ? html`<div class="ds-row-desc">${() => getSliderDescription(p, state.sliderPreviewValues[p.key] ?? state.values[p.key])}</div>`
+            : (p.description ? html`<div class="ds-row-desc">${p.description}</div>` : "")}
           ${() => {
             const reason = lockReason()
             return reason ? html`<div class="ds-row-desc"><strong>Locked:</strong> ${reason}</div>` : ""
@@ -1582,9 +1772,10 @@ function renderSettingRow(p) {
             </div>
           ` : ""}
         </div>
-        ${(isNumeric || isColor) ? html`<span class="ds-row-value" id="ds-display-${p.key}">${() => {
+        ${(isNumeric || isColor || isReadout) ? html`<span class="ds-row-value ${isReadout ? "ds-row-readout" : ""}" id="ds-display-${p.key}">${() => {
             if (isColor) return formatColorDisplayValue(p)
-            const currentValue = state.values[p.key]
+            if (isReadout) return formatReadoutValue(p)
+            const currentValue = state.sliderPreviewValues[p.key] ?? state.values[p.key]
             const bounds = numericBounds(p)
             return currentValue !== undefined ? formatSliderValue(currentValue, String(bounds.step), p.precision, p.key) : ".."
           }}</span>` : ""}
@@ -1638,6 +1829,7 @@ export function DeviceSettings({ params }) {
 
   fetchFlmWorkspace()
   ensureFavoriteValuePolling()
+  ensureCscCalibrationPolling()
 
   if (!state.fetched) {
     state.fetched = true

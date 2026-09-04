@@ -130,8 +130,13 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     userBookmark @95;
     excessiveActuation @96;
     audioFeedback @97;
+    bigModelLoading @100;
+    bigModelFailed @102;
 
     soundsUnavailableDEPRECATED @47;
+    stockLkasDEPRECATED @98;
+    lateralManeuverDEPRECATED @99;
+    bigModelReadyDEPRECATED @101;
   }
 }
 
@@ -467,6 +472,10 @@ struct CanData {
 struct DeviceState @0xa4d8b5af2aa492eb {
   deviceType @45 :InitData.DeviceType;
 
+  # usb
+  chestnutPresent @51 :Bool;
+  usbState @52 :UsbState;
+
   networkType @22 :NetworkType;
   networkInfo @31 :NetworkInfo;
   networkStrength @24 :NetworkStrength;
@@ -498,7 +507,8 @@ struct DeviceState @0xa4d8b5af2aa492eb {
   pmicTempC @39 :List(Float32);
   intakeTempC @46 :Float32;
   exhaustTempC @47 :Float32;
-  caseTempC @48 :Float32;
+  gnssTempC @48 :Float32;
+  bottomSocTempC @50 :Float32;
   maxTempC @44 :Float32;  # max of other temps, used to control fan
   thermalZones @38 :List(ThermalZone);
   thermalStatus @14 :ThermalStatus;
@@ -512,10 +522,10 @@ struct DeviceState @0xa4d8b5af2aa492eb {
   }
 
   enum ThermalStatus {
-    green @0;
-    yellow @1;
-    red @2;
-    danger @3;
+    ok @0;
+    warmDEPRECATED @1;
+    overheated @2;
+    critical @3;
   }
 
   enum NetworkType {
@@ -729,6 +739,41 @@ struct PeripheralState {
     cdp @2;
     dcp @3;
   }
+}
+
+struct UsbState {
+  devices @0 :List(Device);
+
+  struct Device {
+    busnum @0 :UInt8;
+    devnum @1 :UInt8;
+    vendorId @2 :UInt16;
+    productId @3 :UInt16;
+    speedMbps @4 :UInt16;
+    manufacturer @6 :Text;
+    product @5 :Text;
+    linkErrorCount @7 :UInt16;
+    usb3Lane @8 :Usb3Lane;
+
+    enum Usb3Lane {
+      unknown @0;
+      a @1;
+      b @2;
+    }
+  }
+}
+
+struct ChestnutState {
+  tempC @0 :Float32;
+  memoryTempC @1 :Float32;
+  powerDrawW @2 :Float32;
+  powerLimitW @3 :Float32;
+  gpuUsagePercent @4 :UInt8;
+  gpuClockMhz @5 :UInt16;
+  fanSpeedRpm @6 :UInt16;
+  pcieLtssm @7 :UInt8;
+  supplyVoltage @8 :UInt16;  # mV
+  supplyCurrent @9 :Int16;  # mA
 }
 
 struct RadarState @0x9a185389d6fdd05f {
@@ -1281,6 +1326,11 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
 
 
   solverExecutionTime @35 :Float32;
+
+  leadTrajectoryX0 @40 :List(Float32);
+  leadTrajectoryV0 @41 :List(Float32);
+  leadTrajectoryX1 @42 :List(Float32);
+  leadTrajectoryV1 @43 :List(Float32);
 
   enum LongitudinalPlanSource {
     cruise @0;
@@ -2687,6 +2737,7 @@ struct Event {
     procLog @33 :ProcLog;
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
+    chestnutState @152 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
@@ -2706,6 +2757,7 @@ struct Event {
     userBookmark @93 :UserBookmark;
     bookmarkButton @148 :UserBookmark;
     audioFeedback @149 :AudioFeedback;
+    visionSpeedLimitBookmark @153 :UserBookmark;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
     # *********** debug ***********
@@ -2742,7 +2794,7 @@ struct Event {
     starpilotSelfdriveState @115 :Custom.StarPilotSelfdriveState;
     customReserved9 @116 :Custom.CustomReserved9;
     starpilotLateralManeuverPlanDEPRECATED @136 :Custom.StarPilotLateralManeuverPlanDEPRECATED;
-    customReserved11 @137 :Custom.CustomReserved11;
+    starpilotLateralState @137 :Custom.StarPilotLateralState;
     customReserved12 @138 :Custom.CustomReserved12;
     customReserved13 @139 :Custom.CustomReserved13;
     customReserved14 @140 :Custom.CustomReserved14;

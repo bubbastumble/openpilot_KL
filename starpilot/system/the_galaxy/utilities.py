@@ -5,16 +5,19 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 from urllib.parse import quote
@@ -649,6 +652,62 @@ def encode_parameters(params_dict):
   encoded_data = base64.b64encode(obfuscated_data.encode("utf-8")).decode("utf-8")
   return encoded_data
 
+# The venv ships ffmpeg/ffprobe as console scripts that exec the real binary only
+# after a full CPython startup. Resolve past the shim once and skip that per call.
+def _resolve_ffmpeg_binary(name):
+  try:
+    import ffmpeg as ffmpeg_package
+    candidate = Path(ffmpeg_package.__file__).parent / "install" / "bin" / name
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+      return str(candidate)
+  except Exception:
+    pass
+  return shutil.which(name) or name
+
+
+FFMPEG_BIN = _resolve_ffmpeg_binary("ffmpeg")
+FFPROBE_BIN = _resolve_ffmpeg_binary("ffprobe")
+
+# Bound the cache by its own size rather than reacting to free space: loggerd already
+# keeps the disk near full, so the old policy wiped every mp4 on almost every request.
+VIDEO_CACHE_MAX_BYTES = 512 * 1024 * 1024
+# A malformed or truncated segment must not occupy the Galaxy's only remux worker
+# forever. Stream-copy normally finishes in seconds; this also bounds the fallback.
+VIDEO_REMUX_TIMEOUT_SECONDS = 60
+# Bound combined-route streams as well. Scale the deadline with route length below.
+VIDEO_STREAM_TIMEOUT_SECONDS = 120
+
+
+def _prune_video_cache(keep_path=None):
+  """Evict oldest-first until the cache fits its budget."""
+  try:
+    entries = []
+    for cache_file in VIDEO_CACHE_PATH.glob("*.mp4"):
+      try:
+        stat = cache_file.stat()
+      except OSError:
+        continue
+      entries.append((stat.st_mtime, stat.st_size, cache_file))
+  except OSError:
+    return
+
+  total = sum(size for _, size, _ in entries)
+  if total <= VIDEO_CACHE_MAX_BYTES:
+    return
+
+  keep = str(keep_path) if keep_path else None
+  for _, size, cache_file in sorted(entries):
+    if total <= VIDEO_CACHE_MAX_BYTES:
+      break
+    if keep and str(cache_file) == keep:
+      continue
+    try:
+      cache_file.unlink()
+      total -= size
+    except OSError:
+      pass
+
+
 def ffmpeg_concat_segments_to_mp4(input_files, cache_key=None):
   if not input_files:
     raise ValueError("No input files provided for concatenation")
@@ -664,6 +723,8 @@ def ffmpeg_concat_segments_to_mp4(input_files, cache_key=None):
   if cache_path.exists() and all(cache_path.stat().st_mtime > Path(f).stat().st_mtime for f in input_files):
     return open(cache_path, "rb")
 
+  _prune_video_cache(keep_path=cache_path)
+
   list_file = VIDEO_CACHE_PATH / f"{file_hash}.txt"
   with open(list_file, "w") as f:
     for seg in input_files:
@@ -671,14 +732,14 @@ def ffmpeg_concat_segments_to_mp4(input_files, cache_key=None):
 
   try:
     subprocess.run(
-      ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+      [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
        "-i", str(list_file), "-c", "copy", "-movflags", "faststart", "-y", str(cache_path)],
       check=True
     )
   except subprocess.CalledProcessError:
     try:
       subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
          "-i", str(list_file), "-c:v", "libx264", "-movflags", "faststart", "-y", str(cache_path)],
         check=True
       )
@@ -692,7 +753,84 @@ def ffmpeg_concat_segments_to_mp4(input_files, cache_key=None):
 
   return open(cache_path, "rb")
 
-def ffmpeg_mp4_wrap_process_builder(filename):
+
+def ffmpeg_stream_concatenated_mp4(input_files, chunk_size=256 * 1024):
+  """Stream-copy camera segments as fragmented MP4 without building a full cache file."""
+  if not input_files:
+    raise ValueError("No input files provided for concatenation")
+
+  VIDEO_CACHE_PATH.mkdir(exist_ok=True)
+  with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="route-download-", dir=VIDEO_CACHE_PATH, delete=False) as list_file:
+    list_path = Path(list_file.name)
+    for segment in input_files:
+      list_file.write(f"file '{Path(segment)}'\n")
+
+  process = None
+  reader_thread = None
+  try:
+    process = subprocess.Popen(
+      [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+       "-i", str(list_path), "-c", "copy", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+       "-f", "mp4", "pipe:1"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+    )
+    chunks = queue.Queue(maxsize=4)
+    deadline = time.monotonic() + max(VIDEO_STREAM_TIMEOUT_SECONDS, len(input_files) * 2.0)
+
+    def read_stdout():
+      try:
+        while True:
+          chunk = process.stdout.read(chunk_size)
+          if not chunk:
+            chunks.put(("eof", None))
+            return
+          chunks.put(("data", chunk))
+      except Exception as error:
+        chunks.put(("error", error))
+
+    reader_thread = threading.Thread(target=read_stdout, name="route-video-reader", daemon=True)
+    reader_thread.start()
+
+    while True:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise TimeoutError("Timed out streaming the combined route video")
+      try:
+        kind, value = chunks.get(timeout=remaining)
+      except queue.Empty as error:
+        raise TimeoutError("Timed out streaming the combined route video") from error
+      if kind == "data":
+        yield value
+      elif kind == "error":
+        raise ValueError("Could not read the combined route video") from value
+      else:
+        if process.wait(timeout=max(0.1, remaining)) != 0:
+          raise ValueError("Could not stream the combined route video")
+        break
+  finally:
+    if process is not None:
+      if process.stdout is not None:
+        process.stdout.close()
+      if process.poll() is None:
+        process.terminate()
+        try:
+          process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+          process.kill()
+          process.wait()
+    if reader_thread is not None:
+      reader_thread.join(timeout=1)
+    try:
+      list_path.unlink()
+    except OSError:
+      pass
+
+def ffmpeg_mp4_wrap_to_path(filename):
+  """Remux one raw .hevc segment to mp4 and return the cache path.
+
+  Callers get a path, not a handle, so send_file can stream it without reading it all.
+  """
   input_path = Path(filename)
 
   if not input_path.exists():
@@ -707,31 +845,45 @@ def ffmpeg_mp4_wrap_process_builder(filename):
 
   VIDEO_CACHE_PATH.mkdir(exist_ok=True)
 
-  total, used, free = shutil.disk_usage(VIDEO_CACHE_PATH)
-  if free < 500 * 1024 * 1024:
-    for cache_file in VIDEO_CACHE_PATH.glob("*.mp4"):
-      try:
-        cache_file.unlink()
-      except:
-        pass
-
   file_hash = hashlib.md5(str(input_path).encode()).hexdigest()
   cache_path = VIDEO_CACHE_PATH / f"{file_hash}.mp4"
 
   if cache_path.exists() and cache_path.stat().st_mtime > input_path.stat().st_mtime:
-    return open(cache_path, "rb")
+    return cache_path
+
+  _prune_video_cache(keep_path=cache_path)
+  deadline = time.monotonic() + VIDEO_REMUX_TIMEOUT_SECONDS
+
+  def remaining_time():
+    return max(0.1, deadline - time.monotonic())
 
   try:
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-movflags", "faststart", "-y", str(cache_path)], check=True)
+    subprocess.run(
+      [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", str(input_path),
+       "-c", "copy", "-movflags", "faststart", "-y", str(cache_path)],
+      check=True,
+      timeout=remaining_time(),
+    )
+  except subprocess.TimeoutExpired:
+    cache_path.unlink(missing_ok=True)
+    raise ValueError(f"Timed out processing video file: {input_path}")
   except subprocess.CalledProcessError:
     try:
-      subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path), "-c:v", "libx264", "-movflags", "faststart", "-y", str(cache_path)], check=True)
-    except subprocess.CalledProcessError:
-      if cache_path.exists():
-        cache_path.unlink()
+      subprocess.run(
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", str(input_path),
+         "-c:v", "libx264", "-movflags", "faststart", "-y", str(cache_path)],
+        check=True,
+        timeout=remaining_time(),
+      )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+      cache_path.unlink(missing_ok=True)
       raise ValueError(f"Cannot process video file: {input_path}")
 
-  return open(cache_path, "rb")
+  return cache_path
+
+
+def ffmpeg_mp4_wrap_process_builder(filename):
+  return open(ffmpeg_mp4_wrap_to_path(filename), "rb")
 
 def format_git_date(raw_date: str):
   date_object = datetime.strptime(raw_date.split()[1], "%Y-%m-%d")
@@ -951,7 +1103,7 @@ def _dashboard_time_is_valid(value, now=None, require_recent=False):
   return True
 
 
-def _timestamp_to_dashboard_time(timestamp, require_recent=False):
+def _timestamp_to_dashboard_time(timestamp, require_recent=False, now=None):
   timestamp = _safe_float(timestamp, 0.0)
   if timestamp <= 0.0:
     return None
@@ -959,7 +1111,7 @@ def _timestamp_to_dashboard_time(timestamp, require_recent=False):
     parsed = datetime.fromtimestamp(timestamp)
   except (OSError, OverflowError, ValueError):
     return None
-  return parsed if _dashboard_time_is_valid(parsed, require_recent=require_recent) else None
+  return parsed if _dashboard_time_is_valid(parsed, require_recent=require_recent, now=now) else None
 
 
 def _parse_segment_dir_name(name):
@@ -993,17 +1145,28 @@ def _select_dashboard_segment_candidate(candidates):
   return next((candidate for candidate in candidates if _segment_has_dashboard_log(candidate)), candidates[0])
 
 
-def _estimate_route_started_at(segments):
-  estimates = []
+def _estimate_route_start_details(segments):
+  # Reading a compressed qlog materializes the complete log in memory. Route
+  # log analysis happens in the bounded background worker; the synchronous
+  # dashboard path must only use filesystem metadata.
+  filesystem_estimates = []
   for segment in segments:
     segment_num = max(0, _safe_int(segment.get("num", 0), 0))
     # Segment directory mtimes normally land at the end of their one-minute segment.
     estimate = _segment_mtime(segment.get("path")) - (segment_num + 1) * 60
-    parsed = _timestamp_to_dashboard_time(estimate, require_recent=True)
+    parsed = _timestamp_to_dashboard_time(estimate)
     if parsed is not None:
-      estimates.append(parsed.timestamp())
+      filesystem_estimates.append(parsed.timestamp())
+
   # Dashboard analysis can touch a segment directory later, but cannot make it older.
-  return datetime.fromtimestamp(min(estimates)) if estimates else None
+  if filesystem_estimates:
+    return datetime.fromtimestamp(min(filesystem_estimates)), DASHBOARD_TIME_SOURCE_FILESYSTEM
+
+  return None, ""
+
+
+def _estimate_route_started_at(segments):
+  return _estimate_route_start_details(segments)[0]
 
 
 def _list_dashboard_routes(footage_paths, limit=DASHBOARD_ROUTE_SCAN_LIMIT):
@@ -1037,8 +1200,25 @@ def _list_dashboard_routes(footage_paths, limit=DASHBOARD_ROUTE_SCAN_LIMIT):
       route["segments_by_num"].setdefault(segment_num, []).append(entry)
       route["modified_at"] = max(route["modified_at"], _segment_mtime(entry))
 
+  # Route IDs are monotonically increasing on-device and remain reliable when
+  # the wall clock is wrong. Bound the candidate set before inspecting segment
+  # contents so old route history cannot make every homepage request unbounded.
+  def route_sequence(route):
+    try:
+      return int(str(route["name"]).split("--", 1)[0], 16)
+    except (KeyError, TypeError, ValueError):
+      return -1
+
+  candidates = sorted(
+    routes.values(),
+    key=lambda route: (route_sequence(route), route["modified_at"], route["name"]),
+    reverse=True,
+  )
+  if limit is not None:
+    candidates = candidates[:max(0, limit)]
+
   route_infos = []
-  for route in routes.values():
+  for route in candidates:
     segments = []
     for segment_num, candidates in sorted(route["segments_by_num"].items()):
       selected = _select_dashboard_segment_candidate(candidates)
@@ -1048,7 +1228,7 @@ def _list_dashboard_routes(footage_paths, limit=DASHBOARD_ROUTE_SCAN_LIMIT):
     if not segments:
       continue
 
-    started_at = _estimate_route_started_at(segments)
+    started_at, time_source = _estimate_route_start_details(segments)
 
     route_infos.append({
       "name": route["name"],
@@ -1056,7 +1236,7 @@ def _list_dashboard_routes(footage_paths, limit=DASHBOARD_ROUTE_SCAN_LIMIT):
       "segmentCount": len(segments),
       "startedAt": started_at,
       "modifiedAt": route["modified_at"],
-      "timeSource": DASHBOARD_TIME_SOURCE_FILESYSTEM if started_at is not None else "",
+      "timeSource": time_source,
     })
 
   route_infos.sort(key=lambda route: (
@@ -1425,15 +1605,15 @@ def _public_drive(drive, is_metric):
   return public
 
 
-def _route_time_range(route_info, duration_seconds):
+def _route_time_range(route_info, duration_seconds, now=None):
   modified_at = _safe_float(route_info.get("modifiedAt", 0.0), 0.0)
   duration_seconds = max(0.0, _safe_float(duration_seconds, 0.0))
   started_at = route_info.get("startedAt")
-  if _dashboard_time_is_valid(started_at, require_recent=True):
+  if _dashboard_time_is_valid(started_at, now=now, require_recent=True):
     end_time = started_at + timedelta(seconds=duration_seconds) if duration_seconds > 0.0 else None
     return _jsonable_time(started_at), _jsonable_time(end_time)
 
-  modified_time = _timestamp_to_dashboard_time(modified_at, require_recent=True)
+  modified_time = _timestamp_to_dashboard_time(modified_at, now=now, require_recent=True)
   if modified_time is not None and duration_seconds > 0.0:
     end_time = modified_time
     start_time = end_time - timedelta(seconds=duration_seconds)
@@ -1445,10 +1625,10 @@ def _distance_from_meters(distance_m, is_metric):
   return distance_m * (METER_TO_KILOMETER if is_metric else METER_TO_MILE)
 
 
-def _route_shell_drive(route_info, params_obj, model_names, is_metric):
+def _route_shell_drive(route_info, params_obj, model_names, is_metric, now=None):
   segment_count = max(0, _safe_int(route_info.get("segmentCount", 0), 0))
   duration_seconds = segment_count * 60
-  start_date, end_date = _route_time_range(route_info, duration_seconds)
+  start_date, end_date = _route_time_range(route_info, duration_seconds, now=now)
   return {
     "name": route_info.get("name", ""),
     "routeNames": [route_info.get("name", "")],
@@ -1670,8 +1850,58 @@ def _invalidate_dashboard_cache():
   })
 
 
+def clear_dashboard_route_history(params_obj, retained_route_names=None):
+  """Remove route-backed dashboard history while keeping durable records and optional retained routes."""
+  stats = _load_dashboard_persistent_stats(params_obj)
+  routes = stats.get("routes", {})
+  retained_routes = None if retained_route_names is None else {
+    str(route_name or "").strip()
+    for route_name in retained_route_names
+    if ROUTE_RE.fullmatch(str(route_name or "").strip())
+  }
+  if retained_routes is None:
+    stats["routes"] = {}
+    stats["ignoredRoutes"] = []
+  else:
+    stats["routes"] = {
+      route_name: entry
+      for route_name, entry in routes.items()
+      if route_name in retained_routes
+    }
+    stats["ignoredRoutes"] = [
+      route_name
+      for route_name in stats.get("ignoredRoutes", [])
+      if route_name in retained_routes
+    ]
+  route_count = len(routes) - len(stats["routes"])
+  serialized = json.dumps(stats, separators=(",", ":"))
+
+  persisted_to_params = False
+  if params_obj is not None:
+    try:
+      params_obj.put(DASHBOARD_PERSISTENT_STATS_PARAM, serialized)
+      persisted_to_params = True
+    except Exception:
+      pass
+
+  fallback_path = _dashboard_param_file_path(DASHBOARD_PERSISTENT_STATS_PARAM)
+  if persisted_to_params:
+    try:
+      fallback_path.unlink()
+    except (FileNotFoundError, OSError):
+      pass
+  elif not _write_dashboard_param_file(DASHBOARD_PERSISTENT_STATS_PARAM, serialized):
+    raise RuntimeError("Unable to clear persisted dashboard route history.")
+
+  _invalidate_dashboard_cache()
+  return route_count
+
+
 def warm_dashboard_stats(footage_paths=None):
   params_obj = params
+  if params_obj.get_bool("IsOnroad"):
+    return
+
   route_infos = _list_dashboard_routes(footage_paths or [])
 
   if not route_infos:
@@ -1689,6 +1919,8 @@ def warm_dashboard_stats(footage_paths=None):
   persistent_stats = _load_dashboard_persistent_stats(params_obj)
   candidates = _analysis_candidates(route_infos, persistent_stats)[:DASHBOARD_BACKGROUND_ROUTE_ANALYSIS_LIMIT]
   for route_info in candidates:
+    if params_obj.get_bool("IsOnroad"):
+      break
     full_route_info = dict(route_info)
     full_route_info["analysisSegmentCount"] = max(0, _safe_int(route_info.get("segmentCount", 0), 0))
     messages = _iter_route_log_messages(full_route_info)
@@ -1771,6 +2003,39 @@ def _clear_dashboard_analyzer_status():
     pass
 
 
+def _dashboard_analyzer_pid_matches(pid):
+  try:
+    command = Path(f"/proc/{pid}/cmdline").read_bytes()
+  except OSError:
+    return False
+  return b"warm_dashboard_stats" in command
+
+
+def stop_dashboard_background_analysis():
+  global _DASHBOARD_ANALYZER_PROCESS
+
+  stopped = False
+  with _DASHBOARD_ANALYZER_LOCK:
+    process = _DASHBOARD_ANALYZER_PROCESS
+    if process is not None and process.poll() is None:
+      process.terminate()
+      stopped = True
+    else:
+      status = _read_dashboard_analyzer_status()
+      pid = _safe_int(status.get("pid", 0), 0)
+      if pid > 0 and _dashboard_analyzer_pid_matches(pid):
+        try:
+          os.kill(pid, signal.SIGTERM)
+          stopped = True
+        except (ProcessLookupError, PermissionError, OSError):
+          pass
+
+    _DASHBOARD_ANALYZER_PROCESS = None
+    _clear_dashboard_analyzer_status()
+
+  return stopped
+
+
 def _dashboard_analysis_status(candidates):
   pending_count = len(candidates or [])
   return {
@@ -1784,10 +2049,12 @@ def _start_dashboard_background_analysis(footage_paths, route_infos, persistent_
   global _DASHBOARD_ANALYZER_PROCESS
 
   candidates = candidates if candidates is not None else _analysis_candidates(route_infos, persistent_stats)
-  if not route_infos or not candidates:
+  if params.get_bool("IsOnroad") or not route_infos or not candidates:
     return False
 
   with _DASHBOARD_ANALYZER_LOCK:
+    if params.get_bool("IsOnroad"):
+      return False
     if _dashboard_analyzer_running():
       return True
     repo_root = Path(__file__).resolve().parents[3]
@@ -2170,7 +2437,7 @@ def _model_usage_key(model_name):
   clean_name = _clean_model_label(model_name)
   if not clean_name or clean_name == "Unknown model":
     return ""
-  return canonical_model_key(clean_name) or clean_name.lower()
+  return re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-")
 
 
 def _better_record(current, previous, metric_key):
@@ -2576,7 +2843,7 @@ def _normalize_temp_c(value):
   return raw if 0 < raw < 150 else None
 
 
-def _read_hardware_cpu_temps():
+def _read_hardware_component_temps(component):
   try:
     from openpilot.system.hardware import HARDWARE
     thermal_config = HARDWARE.get_thermal_config()
@@ -2584,18 +2851,26 @@ def _read_hardware_cpu_temps():
   except Exception:
     return []
 
-  cpu_temps = thermal_msg.get("cpuTempC", [])
-  if not isinstance(cpu_temps, (list, tuple)):
-    cpu_temps = [cpu_temps]
+  temps = thermal_msg.get(f"{component}TempC", [])
+  if not isinstance(temps, (list, tuple)):
+    temps = [temps]
   return [
-    temp for temp in (_normalize_temp_c(value) for value in cpu_temps)
+    temp for temp in (_normalize_temp_c(value) for value in temps)
     if temp is not None
   ]
 
 
-def _read_cpu_temp_c(thermal_root=None):
+def _read_hardware_cpu_temps():
+  return _read_hardware_component_temps("cpu")
+
+
+def _read_hardware_gpu_temps():
+  return _read_hardware_component_temps("gpu")
+
+
+def _read_component_temp_c(component, thermal_root=None):
   if thermal_root is None:
-    hardware_temps = _read_hardware_cpu_temps()
+    hardware_temps = _read_hardware_component_temps(component)
     if hardware_temps:
       return round(max(hardware_temps))
     thermal_root = Path("/sys/class/thermal")
@@ -2611,7 +2886,7 @@ def _read_cpu_temp_c(thermal_root=None):
       zone_type = temp_path.with_name("type").read_text(encoding="utf-8").strip().lower()
     except Exception:
       zone_type = ""
-    if "cpu" not in zone_type:
+    if component not in zone_type:
       continue
     try:
       raw = temp_path.read_text().strip()
@@ -2624,10 +2899,19 @@ def _read_cpu_temp_c(thermal_root=None):
   return round(max(values)) if values else None
 
 
+def _read_cpu_temp_c(thermal_root=None):
+  return _read_component_temp_c("cpu", thermal_root)
+
+
+def _read_gpu_temp_c(thermal_root=None):
+  return _read_component_temp_c("gpu", thermal_root)
+
+
 def _build_device_summary(params_obj):
   is_onroad = _params_get_bool(params_obj, "IsOnroad")
   uptime_seconds = _read_uptime_seconds()
   cpu_temp_c = _read_cpu_temp_c()
+  gpu_temp_c = _read_gpu_temp_c()
   lan_ip = get_current_lan_ip()
   network_name = get_current_network_name()
   return {
@@ -2635,6 +2919,7 @@ def _build_device_summary(params_obj):
     "online": True,
     "uptimeSeconds": uptime_seconds,
     "cpuTempC": cpu_temp_c,
+    "gpuTempC": gpu_temp_c,
     "lanIp": lan_ip,
     "networkName": network_name,
   }
@@ -2719,7 +3004,7 @@ def get_dashboard_stats(footage_paths, params_obj=None, now=None):
 
   persistent_stats = _load_dashboard_persistent_stats(params_obj)
   shell_drives = [
-    _route_shell_drive(route_info, params_obj, model_names, is_metric)
+    _route_shell_drive(route_info, params_obj, model_names, is_metric, now=now)
     for route_info in route_infos
   ]
   if shell_drives:
@@ -2765,7 +3050,7 @@ def get_dashboard_stats(footage_paths, params_obj=None, now=None):
 
   _DASHBOARD_CACHE.update({
     "key": cache_key,
-    "updated_at": cache_now,
+    "updated_at": time.monotonic(),
     "value": copy.deepcopy(dashboard),
   })
   return dashboard
@@ -2831,6 +3116,37 @@ def get_route_log_path(path):
   return None
 
 
+def _route_logged_start_time(log_path, reader=None):
+  """Recover a route's wall-clock start when filesystem time was reset at boot."""
+  try:
+    if reader is None:
+      from openpilot.tools.lib.logreader import _LogFileReader
+      reader = _LogFileReader(str(log_path))
+
+    first_mono_time = None
+    for message in reader:
+      mono_time = _safe_float(getattr(message, "logMonoTime", 0), 0.0) / 1e9
+      if mono_time <= 0.0:
+        continue
+      first_mono_time = mono_time if first_mono_time is None else min(first_mono_time, mono_time)
+
+      message_type = _message_type(message)
+      payload = _message_payload(message, message_type)
+      wall_time = _wall_time_seconds_from_payload(payload)
+      if wall_time is None:
+        wall_time = _wall_time_seconds_from_payload(message)
+      if wall_time is None:
+        continue
+
+      start_seconds = wall_time - (mono_time - first_mono_time)
+      start_time = datetime.fromtimestamp(start_seconds)
+      if _dashboard_time_is_valid(start_time):
+        return start_time
+  except Exception:
+    return None
+  return None
+
+
 def get_route_start_time(path):
   log_path = get_route_log_path(path)
   if log_path is None:
@@ -2847,6 +3163,16 @@ def get_route_start_time(path):
   if modified_time <= 0:
     return None
 
+  filesystem_time = _timestamp_to_dashboard_time(modified_time)
+  if filesystem_time is not None:
+    return filesystem_time
+
+  # Recover dates from logs only for files created while the system clock was
+  # genuinely invalid. Normal route browsing stays metadata-only.
+  logged_time = _route_logged_start_time(log_path)
+  if logged_time is not None:
+    return logged_time
+
   return datetime.fromtimestamp(modified_time)
 
 def get_routes_names(footage_path):
@@ -2854,17 +3180,28 @@ def get_routes_names(footage_path):
   route_times = {segment.route_name.time_str for segment in segments}
   return sorted(route_times, reverse=True)
 
+def get_routes_with_segment_details(footage_path):
+  route_details = {}
+  for segment in get_all_segment_names(footage_path):
+    route_name = segment.route_name.time_str
+    segment_num = int(getattr(segment, "segment_num", 0))
+    details = route_details.setdefault(route_name, {"segmentCount": 0, "firstSegmentNum": segment_num})
+    details["segmentCount"] += 1
+    details["firstSegmentNum"] = min(details["firstSegmentNum"], segment_num)
+  return sorted(route_details.items(), reverse=True)
+
 def get_segments_in_route(route_time_str, footage_path):
-  return [
+  segments = [
     f"{segment.time_str}--{segment.segment_num}"
     for segment in get_all_segment_names(footage_path)
     if segment.time_str == route_time_str
   ]
+  return sorted(segments, key=lambda segment: int(segment.rsplit("--", 1)[1]))
 
 def get_video_duration(input_path):
   try:
     result = subprocess.run([
-      "ffprobe", "-v", "error", "-show_entries", "format=duration",
+      FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
       "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)
     ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
     return float(result.stdout)
@@ -2872,7 +3209,10 @@ def get_video_duration(input_path):
     return 60
 
 def has_preserve_attr(path: str):
-  return PRESERVE_ATTR_NAME in os.listxattr(path) and os.getxattr(path, PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
+  try:
+    return PRESERVE_ATTR_NAME in os.listxattr(path) and os.getxattr(path, PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
+  except (AttributeError, OSError):
+    return False
 
 def list_file(path):
   return sorted(os.listdir(path), reverse=True)
@@ -2889,31 +3229,38 @@ def normalize_theme_name(name, for_path=False):
     return f"{normalized_parts[0]} ({' '.join(normalized_parts[1:])})".replace(" Week", "")
   return ' '.join(normalized_parts).replace(" Week", "")
 
-def process_route(footage_path, route_name):
-  segment_path = f"{footage_path}{route_name}--0"
-  qcamera_path = f"{segment_path}/qcamera.ts"
+def is_route_marker_file(filename):
+  """A renamed route stores its display name as an empty marker file in the segment."""
+  return not filename.endswith((".hevc", ".ts", ".png", ".gif")) and filename not in LOG_CANDIDATES
 
-  png_output_path = os.path.join(segment_path, "preview.png")
-  if not os.path.exists(png_output_path):
-    video_to_png(qcamera_path, png_output_path)
+def _utc_rfc3339(value):
+  if value is None:
+    return None
+  # Naive values come off the filesystem in local time; astimezone reads them that way.
+  return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def process_route(footage_path, route_name, segment_count=0, first_segment_num=0):
+  segment_name = f"{route_name}--{max(0, int(first_segment_num))}"
+  segment_path = os.path.join(footage_path, segment_name)
   custom_name = None
   if os.path.isdir(segment_path):
     for item in os.listdir(segment_path):
-      if not item.endswith((".hevc", ".ts", ".png", ".gif")) and item not in LOG_CANDIDATES:
+      if is_route_marker_file(item):
         custom_name = item
         break
 
-  route_timestamp_str = custom_name
-  if not custom_name:
-    route_timestamp_dt = get_route_start_time(segment_path)
-    route_timestamp_str = route_timestamp_dt.isoformat() if route_timestamp_dt else None
+  route_timestamp_dt = get_route_start_time(segment_path)
+  route_timestamp_str = custom_name or (route_timestamp_dt.isoformat() if route_timestamp_dt else None)
 
   return {
     "name": route_name,
-    "png": f"/thumbnails/{route_name}--0/preview.png",
+    "png": f"/thumbnails/{segment_name}/preview.png",
     "timestamp": route_timestamp_str,
-    "is_preserved": has_preserve_attr(segment_path)
+    "startedAt": _utc_rfc3339(route_timestamp_dt),
+    "isCustomName": custom_name is not None,
+    "is_preserved": has_preserve_attr(segment_path),
+    "segmentCount": max(0, int(segment_count)),
+    "approxDurationSeconds": max(0, int(segment_count)) * 60,
   }
 
 def process_screen_recording(mp4):
@@ -2940,20 +3287,28 @@ def segment_to_segment_name(data_dir, segment):
   full_path = os.path.join(data_dir, f"FakeDongleID1337|{segment}")
   return SegmentName(full_path)
 
+VIDEO_TO_PNG_TIMEOUT_SECONDS = 20
+
 def video_to_png(input_path, output_path):
   try:
     subprocess.run([
-      "ffmpeg", "-hide_banner", "-loglevel", "error",
+      FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
       "-ss", "1",
       "-i", str(input_path),
       "-frames:v", "1",
       "-y",
       str(output_path)
-    ], capture_output=True, check=True, text=True)
-  except subprocess.CalledProcessError as e:
+    ], capture_output=True, check=True, text=True, timeout=VIDEO_TO_PNG_TIMEOUT_SECONDS)
+    return os.path.isfile(output_path)
+  except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
     print(f"Failed to generate PNG for {input_path}")
-    if e.stderr:
+    if getattr(e, "stderr", None):
       print(e.stderr)
+    try:
+      Path(output_path).unlink(missing_ok=True)
+    except OSError:
+      pass
+    return False
 
 def xor_encrypt_decrypt(data, key):
   return "".join(chr(ord(c) ^ ord(key[i % len(key)])) for i, c in enumerate(data))

@@ -16,12 +16,10 @@ from pathlib import Path
 REQUIRED_DIRS = [
   ("usr/local/lib", "/usr/local/lib"),
   ("usr/local/include", "/usr/local/include"),
+  ("usr/local/venv/lib/python3.12/site-packages/raylib/install", "/usr/local/venv/lib/python3.12/site-packages/raylib/install"),
   ("lib/aarch64-linux-gnu", "/lib/aarch64-linux-gnu"),
   ("usr/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu"),
   ("usr/include", "/usr/include"),
-]
-OPTIONAL_DIRS = [
-  ("usr/lib/qt5/bin", "/usr/lib/qt5/bin"),
 ]
 VENDOR_CANDIDATES = ["/system/vendor/lib64", "/vendor/lib64"]
 OPTIONAL_INCLUDE_DIRS: list[str] = []
@@ -236,14 +234,6 @@ def main() -> int:
     dst = output_dir / rel_dst
     print(f"Extracting {src_path} -> {dst}", flush=True)
     run_debugfs(image_path, src_path, dst)
-
-  for rel_dst, src_path in OPTIONAL_DIRS:
-    dst = output_dir / rel_dst
-    try:
-      print(f"Extracting {src_path} -> {dst}", flush=True)
-      run_debugfs(image_path, src_path, dst)
-    except RuntimeError:
-      print(f"WARN: optional path not found in AGNOS image: {src_path}", flush=True)
 
   vendor_ok = False
   vendor_dst = output_dir / "system/vendor/lib64"

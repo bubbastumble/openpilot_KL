@@ -3,7 +3,9 @@ import cereal.messaging as messaging
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.chrysler.values import RAM_DT
 from opendbc.car.gm.values import CAR as GM_CAR, GMFlags, SDGM_CAR
+from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR
 from opendbc.car.interfaces import MAX_CTRL_SPEED
+from opendbc.car.rivian.values import RivianFlags
 
 from openpilot.selfdrive.selfdrived.events import Events
 
@@ -65,9 +67,28 @@ class CarSpecificEvents:
     self.gm_low_speed_alert_shown = False
     self.no_steer_warning = False
     self.silent_steer_warning = True
+    self.rivian = self.CP.brand == "rivian"
+    self.rivian_angle_harness = self.rivian and bool(self.CP.flags & RivianFlags.ANGLE_HARNESS)
+    self.rivian_status_frame = 0
+    self.rivian_angle_saturated = False
+    self.rivian_toi_recovery_failed = False
+    self.rivian_status_params = None
+    self.rivian_angle_params = None
+    if self.rivian:
+      try:
+        from openpilot.common.params import Params
+        self.rivian_status_params = Params(memory=True)
+        if self.rivian_angle_harness:
+          self.rivian_angle_params = self.rivian_status_params
+      except Exception:
+        pass
 
   def update(self, CS: car.CarState, CS_prev: car.CarState, CC: car.CarControl):
     extra_gears = BRAND_EXTRA_GEARS.get(self.CP.brand, None)
+    # The Accord 11G is the only Honda currently using the B/regen gear in
+    # StarPilot. Do not change wrong-gear handling for other Honda models.
+    if self.CP.brand == 'honda' and self.CP.carFingerprint == 'HONDA_ACCORD_11G':
+      extra_gears = [GearShifter.sport, GearShifter.brake]
 
     if self.CP.brand in ('body', 'mock'):
       events = Events()
@@ -178,15 +199,36 @@ class CarSpecificEvents:
       events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears)
 
     elif self.CP.brand == 'hyundai':
-      events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears, pcm_enable=self.CP.pcmCruise, allow_button_cancel=False)
+      ray_ev = self.CP.carFingerprint == HYUNDAI_CAR.KIA_RAY_EV
+      events = self.create_common_events(
+        CS, CS_prev, extra_gears=extra_gears,
+        pcm_enable=self.CP.pcmCruise and not ray_ev,
+        allow_button_cancel=False,
+        ignore_cruise_state=ray_ev,
+      )
+
+    elif self.CP.brand == 'nissan':
+      events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears, pcm_enable=self.CP.pcmCruise)
 
     else:
       events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears)
 
+    if self.rivian:
+      self.rivian_status_frame += 1
+      if self.rivian_status_params is not None and self.rivian_status_frame % 5 == 0:
+        self.rivian_toi_recovery_failed = self.rivian_status_params.get_bool("RivianToiRecoveryFailed")
+        if self.rivian_angle_harness:
+          self.rivian_angle_saturated = self.rivian_status_params.get_bool("RivianAngleSaturated")
+      if self.rivian_toi_recovery_failed:
+        events.add(EventName.steerTempUnavailable)
+    if self.rivian_angle_harness:
+      if self.rivian_angle_saturated:
+        events.add(EventName.steerSaturated)
+
     return events
 
   def create_common_events(self, CS: structs.CarState, CS_prev: car.CarState, extra_gears: list | None = None, pcm_enable=True,
-                           allow_button_cancel=True, suppress_low_speed_alert=False):
+                           allow_button_cancel=True, suppress_low_speed_alert=False, ignore_cruise_state=False):
     events = Events()
     preap_software_cruise = (self.CP.brand == "tesla" and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP" and
                              self.CP.openpilotLongitudinalControl and not self.CP.pcmCruise)
@@ -201,7 +243,7 @@ class CarSpecificEvents:
       events.add(EventName.wrongGear)
     if CS.gearShifter == GearShifter.reverse:
       events.add(EventName.reverseGear)
-    if not CS.cruiseState.available:
+    if not CS.cruiseState.available and not ignore_cruise_state:
       events.add(EventName.wrongCarMode)
     if CS.espDisabled:
       events.add(EventName.espDisabled)

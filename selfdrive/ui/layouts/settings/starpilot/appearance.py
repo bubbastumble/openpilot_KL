@@ -32,7 +32,6 @@ THEME_KEY_CONFIG = {
 COLOR_PRESETS = ["Stock", "#FFFFFF", "#178644", "#3B82F6", "#E63956", "#8B5CF6", "#F59E0B"]
 CAMERA_VIEWS = ["Auto", "Driver", "Standard", "Wide"]
 
-# Mirrors starpilot/ui/qt/offroad/developer_panel.cc:200-218.
 # Keys are the int values stored in DeveloperSidebarMetric{1..7}; values are the
 # human-readable labels shown in both the row value and the picker dialog.
 DEVELOPER_SIDEBAR_METRIC_OPTIONS: dict[int, str] = {
@@ -316,8 +315,7 @@ class StarPilotAppearanceLayout(_SettingsPage):
             SettingRow("StoppedTimer", "toggle", tr_noop("Stopped Timer"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("StoppedTimer"),
-                       set_state=lambda s: self._params.put_bool("StoppedTimer", s),
-                       visible=hud_on),
+                       set_state=lambda s: self._params.put_bool("StoppedTimer", s)),
             SettingRow("ShowCSCStatus", "toggle", tr_noop("CSC Status Widget"),
                        subtitle=tr_noop("Show the Curve Speed Controller target speed and ambient border glow."),
                        get_state=lambda: self._params.get_bool("ShowCSCStatus"),
@@ -335,11 +333,6 @@ class StarPilotAppearanceLayout(_SettingsPage):
                        subtitle="",
                        get_state=lambda: self._params.get_bool("HideMaxSpeed"),
                        set_state=lambda s: self._params.put_bool("HideMaxSpeed", s)),
-            SettingRow("HideSpeedLimit", "toggle", tr_noop("Hide Speed Limit"),
-                       subtitle="",
-                       get_state=lambda: self._params.get_bool("HideSpeedLimit"),
-                       set_state=lambda s: self._params.put_bool("HideSpeedLimit", s),
-                       visible=lambda: ol() and self._params.get_bool("SpeedLimitController")),
             SettingRow("HideAlerts", "toggle", tr_noop("Hide Alerts"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("HideAlerts"),
@@ -355,8 +348,7 @@ class StarPilotAppearanceLayout(_SettingsPage):
             SettingRow("HideLeadMarker", "toggle", tr_noop("Hide Lead Marker"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("HideLeadMarker"),
-                       set_state=lambda s: self._params.put_bool("HideLeadMarker", s),
-                       visible=ol),
+                       set_state=lambda s: self._params.put_bool("HideLeadMarker", s)),
             SettingRow("HideChangingLanesBanner", "toggle", tr_noop("Hide Changing Lanes Banner"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("HideChangingLanesBanner"),
@@ -385,16 +377,15 @@ class StarPilotAppearanceLayout(_SettingsPage):
                        subtitle="",
                        get_state=lambda: self._params.get_bool("RoadNameUI"),
                        set_state=lambda s: self._params.put_bool("RoadNameUI", s)),
-            SettingRow("ShowSpeedLimits", "toggle", tr_noop("Speed Limits"),
+            SettingRow("ShowSpeedLimits", "toggle", tr_noop("Show Speed Limits"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("ShowSpeedLimits"),
-                       set_state=lambda s: self._params.put_bool("ShowSpeedLimits", s),
-                       visible=lambda: not (self._params.get_bool("SpeedLimitController") and ol())),
+                       set_state=lambda s: self._params.put_bool("ShowSpeedLimits", s)),
             SettingRow("UseVienna", "toggle", tr_noop("Vienna Signs"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("UseVienna"),
                        set_state=lambda s: self._params.put_bool("UseVienna", s),
-                       visible=lambda: self._params.get_bool("ShowSpeedLimits") or self._params.get_bool("SpeedLimitController")),
+                       visible=lambda: self._params.get_bool("ShowSpeedLimits")),
             SettingRow("QOLVisuals", "toggle", tr_noop("Quality of Life"),
                        subtitle=tr_noop("Convenience features for everyday driving."),
                        get_state=lambda: self._params.get_bool("QOLVisuals"),
@@ -405,7 +396,7 @@ class StarPilotAppearanceLayout(_SettingsPage):
         self._system_rows = [
             SettingRow("CameraView", "value", tr_noop("Camera View"),
                        subtitle="",
-                       get_value=lambda: tr(CAMERA_VIEWS[self._params.get_int("CameraView")]),
+                       get_value=lambda: tr(CAMERA_VIEWS[self._params.get_int("CameraView", return_default=True, default=2)]),
                        on_click=self._show_camera_view_selector),
             SettingRow("DriverCamera", "toggle", tr_noop("Driver Camera"),
                        subtitle="",
@@ -445,13 +436,12 @@ class StarPilotAppearanceLayout(_SettingsPage):
             SettingRow("ShowStoppingPoint", "toggle", tr_noop("Show Stop Sign"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("ShowStoppingPoint"),
-                       set_state=lambda s: self._params.put_bool("ShowStoppingPoint", s),
-                       enabled=ol),
+                       set_state=lambda s: self._params.put_bool("ShowStoppingPoint", s)),
             SettingRow("ShowStoppingPointMetrics", "toggle", tr_noop("Stop Distance"),
                        subtitle="",
                        get_state=lambda: self._params.get_bool("ShowStoppingPointMetrics"),
                        set_state=lambda s: self._params.put_bool("ShowStoppingPointMetrics", s),
-                       enabled=lambda: self._params.get_bool("ShowStoppingPoint") and ol()),
+                       enabled=lambda: self._params.get_bool("ShowStoppingPoint")),
             SettingRow("DeveloperMetrics", "toggle", tr_noop("Developer Metrics"),
                        subtitle=tr_noop("Performance data, sensor readings, and system metrics."),
                        get_state=lambda: self._params.get_bool("DeveloperMetrics"),
@@ -612,7 +602,7 @@ class StarPilotAppearanceLayout(_SettingsPage):
     # ── Camera view ──
 
     def _show_camera_view_selector(self):
-        current = self._params.get_int("CameraView")
+        current = self._params.get_int("CameraView", return_default=True, default=2)
 
         def on_select(res):
             if res == DialogResult.CONFIRM and dialog.selection:

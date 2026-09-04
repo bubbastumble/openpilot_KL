@@ -15,17 +15,19 @@ import numpy as np
 
 from openpilot.common.constants import CV
 from openpilot.common.realtime import set_core_affinity
+from openpilot.common.swaglog import cloudlog
 from openpilot.starpilot.common.cpu_throttle import device_cpu_throttle_factor
 from openpilot.system.hardware import PC
 
-RUNTIME_LOOP_HZ = 20
-INFERENCE_INTERVAL = 0.15
+RUNTIME_LOOP_HZ = 30
+# Cap steady detector work at 6 Hz while retaining the faster confirmation cadence.
+INFERENCE_INTERVAL = 1.0 / 6.0
 FOLLOWUP_INFERENCE_INTERVAL = 0.10
 FOLLOWUP_WINDOW_SECONDS = 2.0
 TEMPORAL_TRACKING_ENABLED = False
 TRACK_CONFIRMED_PROPOSALS_ENABLED = False
 TRACK_CLASSIFICATION_INTERVAL = 0.12
-TRACK_BUSY_CLASSIFICATION_INTERVAL = 0.35
+TRACK_BUSY_CLASSIFICATION_INTERVAL = 0.50
 TRACK_DETECTOR_INTERVAL = 0.55
 TRACK_MAX_AGE_SECONDS = 2.0
 TRACK_MIN_PROPOSAL_CONFIDENCE = 0.10
@@ -35,7 +37,20 @@ TRACK_MIN_FEATURE_COUNT = 4
 TRACK_MAX_AREA_RATIO = 0.18
 TRACK_CROP_PADDING_RATIO = 0.06
 TRACK_REPEAT_CONFIDENCE_BONUS = 0.12
-BUSY_INFERENCE_INTERVAL = 1.0
+# Keep optional vision work responsive while giving realtime processes more headroom.
+BUSY_INFERENCE_INTERVAL = 1.5
+# Do not schedule another expensive inference before the previous one has given
+# the rest of the device enough time to run. This matters on Mici, where a
+# detector/classifier pass can take several hundred milliseconds.
+PROCESSING_THROTTLE_RATIO = 2.5
+MEMORY_PRESSURE_INFERENCE_INTERVAL = 2.0
+MEMORY_PRESSURE_CLASSIFICATION_INTERVAL = 0.75
+MEMORY_PRESSURE_AVAILABLE_KB = 512 * 1024
+MEMORY_CRITICAL_AVAILABLE_KB = 256 * 1024
+MEMORY_RECOVERY_AVAILABLE_KB = 768 * 1024
+MEMORY_PRESSURE_USAGE_PERCENT = 88
+MEMORY_CRITICAL_USAGE_PERCENT = 94
+MEMORY_RECOVERY_USAGE_PERCENT = 82
 LIVE_POSE_RECOVERY_THROTTLE_SECONDS = 2.0
 LIVE_POSE_RECOVERY_INFERENCE_INTERVAL = 1.0
 RUNTIME_TELEMETRY_INTERVAL_SECONDS = 2.0
@@ -257,6 +272,24 @@ def device_cpu_usage_busy(cpu_usage):
   )
 
 
+def memory_pressure_level(available_kb=None, usage_percent=None):
+  """Classify memory pressure without treating low free page cache as an emergency."""
+  critical = (
+    available_kb is not None and available_kb <= MEMORY_CRITICAL_AVAILABLE_KB
+  ) or (
+    usage_percent is not None and usage_percent >= MEMORY_CRITICAL_USAGE_PERCENT
+  )
+  if critical:
+    return "critical"
+
+  pressure = (
+    available_kb is not None and available_kb <= MEMORY_PRESSURE_AVAILABLE_KB
+  ) or (
+    usage_percent is not None and usage_percent >= MEMORY_PRESSURE_USAGE_PERCENT
+  )
+  return "pressure" if pressure else "normal"
+
+
 @dataclass
 class Detection:
   speed_limit_mph: int
@@ -313,14 +346,14 @@ class SpeedLimitVisionDaemon:
       from openpilot.common.realtime import Ratekeeper
 
       self.messaging = messaging
-      self.pm = messaging.PubMaster(["userBookmark"])
+      self.pm = messaging.PubMaster(["visionSpeedLimitBookmark"])
       self.params = Params(return_defaults=True)
       self.params_memory = Params(memory=True)
       self.is_metric = self.params.get_bool("IsMetric")
       self.Ratekeeper = Ratekeeper
       self.VisionIpcClient = VisionIpcClient
       self.VisionStreamType = VisionStreamType
-      self.sm = messaging.SubMaster(["deviceState", "mapdOut", "userBookmark", "livePose", "starpilotCarState"])
+      self.sm = messaging.SubMaster(["deviceState", "mapdOut", "procLog", "userBookmark", "livePose", "starpilotCarState"])
 
     self.client = None
     self.stream_name = ""
@@ -374,7 +407,9 @@ class SpeedLimitVisionDaemon:
     self.debug_log_path = None
     self.debug_bookmark_count = 0
     self.debug_session_started_at = 0.0
+    self.debug_session_unavailable = False
     self.last_logged_status = ""
+    self.last_published_stream = None
     self.last_logged_candidate = None
     self.last_runtime_telemetry_at = 0.0
     self.last_debug_heartbeat_at = 0.0
@@ -389,6 +424,10 @@ class SpeedLimitVisionDaemon:
     self.last_inference_interval = INFERENCE_INTERVAL
     self.last_inference_interval_reason = "steady"
     self.last_cpu_busy = False
+    self.memory_pressure_state = "normal"
+    self.memory_skip_count = 0
+    self.last_memory_available_kb = None
+    self.last_memory_usage_percent = None
     self.coexistence_mode = False
     self.last_coexistence_param_refresh_at = -float("inf")
     self.temporal_tracking_enabled = TEMPORAL_TRACKING_ENABLED
@@ -404,22 +443,31 @@ class SpeedLimitVisionDaemon:
     self.speed_value_templates = self._build_speed_value_templates()
     self._load_model()
 
-  def _start_debug_session(self):
-    if not self.use_runtime or self.params_memory is None or self.debug_session_id:
-      return
+  def _start_debug_session(self) -> bool:
+    if not self.use_runtime or self.params_memory is None or self.debug_session_id or self.debug_session_unavailable:
+      return False
 
     timestamp = datetime.now(UTC)
     session_id = timestamp.strftime("%Y%m%d_%H%M%S")
     debug_dir = DEBUG_BASE_DIR / session_id
-    suffix = 1
-    while debug_dir.exists():
-      suffix += 1
-      session_id = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{suffix}"
-      debug_dir = DEBUG_BASE_DIR / session_id
+    try:
+      suffix = 1
+      while debug_dir.exists():
+        suffix += 1
+        session_id = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{suffix}"
+        debug_dir = DEBUG_BASE_DIR / session_id
 
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    capture_dir = debug_dir / DEBUG_CAPTURE_DIRNAME
-    capture_dir.mkdir(parents=True, exist_ok=True)
+      debug_dir.mkdir(parents=True, exist_ok=True)
+      capture_dir = debug_dir / DEBUG_CAPTURE_DIRNAME
+      capture_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+      self.debug_session_unavailable = True
+      cloudlog.warning(f"Vision speed-limit debug storage unavailable: {exc}")
+      try:
+        self.params_memory.put("VisionSpeedLimitLastEvent", f"debug storage unavailable: {type(exc).__name__}"[:160])
+      except Exception:
+        pass
+      return False
 
     self.debug_session_id = session_id
     self.debug_dir = debug_dir
@@ -434,6 +482,7 @@ class SpeedLimitVisionDaemon:
     self.params_memory.put_int("VisionSpeedLimitBookmarkCount", self.debug_bookmark_count)
     self.params_memory.put("VisionSpeedLimitLastEvent", "")
     self._write_debug_event("session_start", reason="onroad")
+    return True
 
   def _close_debug_session(self):
     self.debug_session_id = ""
@@ -442,6 +491,7 @@ class SpeedLimitVisionDaemon:
     self.debug_log_path = None
     self.debug_bookmark_count = 0
     self.debug_session_started_at = 0.0
+    self.debug_session_unavailable = False
     self.last_logged_status = ""
     self.last_logged_candidate = None
     self.last_debug_heartbeat_at = 0.0
@@ -749,8 +799,8 @@ class SpeedLimitVisionDaemon:
     if not self.use_runtime or self.pm is None or self.messaging is None:
       return
     self.ignore_next_user_bookmark = True
-    msg = self.messaging.new_message("userBookmark", valid=True)
-    self.pm.send("userBookmark", msg)
+    msg = self.messaging.new_message("visionSpeedLimitBookmark", valid=True)
+    self.pm.send("visionSpeedLimitBookmark", msg)
 
   def _maybe_commit_auto_bookmark(self, now):
     pending = self.pending_auto_bookmark
@@ -852,6 +902,51 @@ class SpeedLimitVisionDaemon:
       return False
     return device_cpu_usage_busy(self.sm["deviceState"].cpuUsagePercent)
 
+  def _update_memory_pressure(self):
+    available_kb = None
+    usage_percent = None
+    if self.sm is not None:
+      if self.sm.valid.get("procLog", False):
+        try:
+          available_kb = int(self.sm["procLog"].mem.available)
+        except (AttributeError, TypeError, ValueError):
+          available_kb = None
+      if self.sm.valid.get("deviceState", False):
+        try:
+          usage_percent = float(self.sm["deviceState"].memoryUsagePercent)
+        except (AttributeError, TypeError, ValueError):
+          usage_percent = None
+
+    self.last_memory_available_kb = available_kb
+    self.last_memory_usage_percent = usage_percent
+    requested = memory_pressure_level(available_kb, usage_percent)
+
+    # Hysteresis prevents reclaim fluctuations from repeatedly starting and stopping inference.
+    if self.memory_pressure_state == "critical":
+      if requested == "critical":
+        return self.memory_pressure_state
+      recovered = (
+        available_kb is not None and available_kb >= MEMORY_RECOVERY_AVAILABLE_KB and
+        (usage_percent is None or usage_percent <= MEMORY_RECOVERY_USAGE_PERCENT)
+      ) or (
+        available_kb is None and usage_percent is not None and usage_percent <= MEMORY_RECOVERY_USAGE_PERCENT
+      )
+      self.memory_pressure_state = "normal" if recovered else "pressure"
+    elif self.memory_pressure_state == "pressure":
+      if requested == "critical":
+        self.memory_pressure_state = "critical"
+      elif (
+        available_kb is not None and available_kb < MEMORY_RECOVERY_AVAILABLE_KB
+      ) or (
+        usage_percent is not None and usage_percent > MEMORY_RECOVERY_USAGE_PERCENT
+      ):
+        return self.memory_pressure_state
+      else:
+        self.memory_pressure_state = "normal"
+    else:
+      self.memory_pressure_state = requested
+    return self.memory_pressure_state
+
   def _update_coexistence_mode(self, now):
     if self.params is None or now - self.last_coexistence_param_refresh_at < COEXISTENCE_PARAM_REFRESH_SECONDS:
       return
@@ -883,20 +978,36 @@ class SpeedLimitVisionDaemon:
     interval = FOLLOWUP_INFERENCE_INTERVAL if in_followup else INFERENCE_INTERVAL
     reason = "followup" if in_followup else "steady"
     self.last_cpu_busy = False
+    memory_pressure = self._update_memory_pressure()
     if now - self.last_live_pose_inputs_not_ok_at < LIVE_POSE_RECOVERY_THROTTLE_SECONDS:
       interval = max(interval, LIVE_POSE_RECOVERY_INFERENCE_INTERVAL)
       reason = "live_pose_recovery"
-    elif self.coexistence_mode:
-      cpu_usage = list(self.sm["deviceState"].cpuUsagePercent) if self.sm is not None and self.sm.valid.get("deviceState", False) else []
-      factor = device_cpu_throttle_factor(cpu_usage, name="SpeedLimit")
-      if factor > 1.05:
+    elif memory_pressure == "critical":
+      interval = max(interval, MEMORY_PRESSURE_INFERENCE_INTERVAL)
+      reason = "memory_critical"
+    elif memory_pressure == "pressure":
+      interval = max(interval, MEMORY_PRESSURE_INFERENCE_INTERVAL)
+      reason = "memory_pressure"
+    else:
+      processing_interval = min(
+        BUSY_INFERENCE_INTERVAL,
+        self.last_frame_process_duration_s * PROCESSING_THROTTLE_RATIO,
+      )
+      if processing_interval > interval:
+        interval = processing_interval
+        reason = "processing_cost"
+
+      if self.coexistence_mode:
+        cpu_usage = list(self.sm["deviceState"].cpuUsagePercent) if self.sm is not None and self.sm.valid.get("deviceState", False) else []
+        factor = device_cpu_throttle_factor(cpu_usage, name="SpeedLimit", cores=SPEED_LIMIT_VISION_COEXISTENCE_AFFINITY_CORES)
+        if factor > 1.05:
+          self.last_cpu_busy = True
+          interval *= factor
+          reason = f"cpu_{factor:.1f}x"
+      elif self._device_cpu_busy():
         self.last_cpu_busy = True
-        interval *= factor
-        reason = f"cpu_{factor:.1f}x"
-    elif self._device_cpu_busy():
-      self.last_cpu_busy = True
-      interval = max(interval, BUSY_INFERENCE_INTERVAL)
-      reason = "cpu_busy"
+        interval = max(interval, BUSY_INFERENCE_INTERVAL)
+        reason = "cpu_busy"
     self.last_inference_interval = interval
     self.last_inference_interval_reason = reason
     return interval
@@ -1234,9 +1345,12 @@ class SpeedLimitVisionDaemon:
     interval = TRACK_CLASSIFICATION_INTERVAL
     if now - self.last_live_pose_inputs_not_ok_at < LIVE_POSE_RECOVERY_THROTTLE_SECONDS:
       return max(interval, LIVE_POSE_RECOVERY_INFERENCE_INTERVAL)
+    memory_pressure = self._update_memory_pressure()
+    if memory_pressure in ("pressure", "critical"):
+      return max(interval, MEMORY_PRESSURE_CLASSIFICATION_INTERVAL)
     if self.coexistence_mode:
       cpu_usage = list(self.sm["deviceState"].cpuUsagePercent) if self.sm is not None and self.sm.valid.get("deviceState", False) else []
-      if device_cpu_throttle_factor(cpu_usage, name="SpeedLimit") > 1.05:
+      if device_cpu_throttle_factor(cpu_usage, name="SpeedLimit", cores=SPEED_LIMIT_VISION_COEXISTENCE_AFFINITY_CORES) > 1.05:
         return max(interval, TRACK_BUSY_CLASSIFICATION_INTERVAL)
     elif self._device_cpu_busy():
       return max(interval, TRACK_BUSY_CLASSIFICATION_INTERVAL)
@@ -2338,13 +2452,20 @@ class SpeedLimitVisionDaemon:
       self._clear_detection()
     if self.params_memory is None:
       return
-    self.params_memory.put("VisionSpeedLimitStatus", status)
-    if self.stream_name:
-      self.params_memory.put("VisionSpeedLimitStream", self.stream_name)
-    else:
-      self.params_memory.remove("VisionSpeedLimitStream")
-    if status != self.last_logged_status:
+
+    status_changed = status != self.last_logged_status
+    if status_changed:
+      self.params_memory.put("VisionSpeedLimitStatus", status)
       self.last_logged_status = status
+
+    if self.stream_name != self.last_published_stream:
+      if self.stream_name:
+        self.params_memory.put("VisionSpeedLimitStream", self.stream_name)
+      else:
+        self.params_memory.remove("VisionSpeedLimitStream")
+      self.last_published_stream = self.stream_name
+
+    if status_changed:
       self._write_debug_event("status", statusText=status)
 
   def _publish_runtime_telemetry(self, now, phase, force=False, **fields):
@@ -2423,6 +2544,9 @@ class SpeedLimitVisionDaemon:
         "lastClassifierForwardCount": self.last_classifier_forward_count,
         "lastClassifierForwardDurationS": round(self.last_classifier_forward_duration_s, 3),
         "cpuUsagePercent": cpu_usage,
+        "memoryAvailableMb": round(self.last_memory_available_kb / 1024, 1) if self.last_memory_available_kb is not None else None,
+        "memoryUsagePercent": round(self.last_memory_usage_percent, 1) if self.last_memory_usage_percent is not None else None,
+        "memoryPressure": self.memory_pressure_state,
         "livePoseInputsOK": live_pose_inputs_ok,
         "publishedSpeedLimitMph": self.published_speed_limit_mph,
         "speedLimitUnit": self._speed_value_unit(),
@@ -2554,6 +2678,7 @@ class SpeedLimitVisionDaemon:
       now = time.monotonic()
       self.loop_count += 1
       self.sm.update(0)
+      self._update_memory_pressure()
 
       if self.sm.updated["userBookmark"]:
         if self.ignore_next_user_bookmark:
@@ -2589,8 +2714,7 @@ class SpeedLimitVisionDaemon:
         self.started_prev = True
         self._start_debug_session()
         self._publish_runtime_telemetry(now, "onroad_start", force=True)
-      elif not self.debug_session_id:
-        self._start_debug_session()
+      elif not self.debug_session_id and self._start_debug_session():
         self._write_debug_event("session_recovered", reason="missing_debug_session_while_onroad")
         self._publish_runtime_telemetry(now, "session_recovered", force=True)
 
@@ -2613,6 +2737,14 @@ class SpeedLimitVisionDaemon:
         self._write_debug_event("road_change", previousRoadName=self.last_road_name, roadName=road_name)
         self._clear_detection()
       self.last_road_name = road_name or self.last_road_name
+
+      if self.memory_pressure_state == "critical":
+        self.memory_skip_count += 1
+        self._disconnect_camera()
+        self._publish_status("Memory pressure - inference paused", clear_speed=True)
+        self._publish_runtime_telemetry(now, "memory_pressure")
+        ratekeeper.keep_time()
+        continue
 
       if not self._connect_camera():
         self.camera_unavailable_count += 1

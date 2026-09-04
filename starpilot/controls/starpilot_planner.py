@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.lead_behavior import (
   should_track_lead,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import A_CHANGE_COST, DANGER_ZONE_COST, J_EGO_COST, STOP_DISTANCE
+from openpilot.selfdrive.controls.lib.longitudinal_vehicle_tunes import get_lead_follow_jerk_scale
 
 from openpilot.starpilot.common.starpilot_utilities import calculate_lane_width, calculate_road_curvature
 from openpilot.starpilot.common.starpilot_variables import CRUISING_SPEED, MINIMUM_LATERAL_ACCELERATION, PLANNER_TIME, THRESHOLD
@@ -30,6 +31,22 @@ from openpilot.starpilot.controls.lib.starpilot_vcruise import StarPilotVCruise
 from openpilot.starpilot.controls.lib.weather_checker import WeatherChecker
 
 RADARLESS_TRACK_HOLD_TIME = 0.45
+FORCE_STOP_JERK_SCALE = 0.20  # accel-change cost multiplier for the whole stop approach,
+                              # envelope included (125 -> 25). Lower = reaches the braking
+                              # target sooner; it does not make the target deeper. Response
+                              # is super-linear here, so raise it if onset feels like a step.
+FORCE_STOP_JERK_SCALE_OVERRIDES = {
+  # The Elantra's current force-stop ramp is smooth, but it waits too long
+  # before building decel and then arrives at the initial brake too abruptly.
+  # Increase the accel-change cost to spread the same stop over more time;
+  # this does not alter the force-stop distance.
+  "HYUNDAI_ELANTRA_2021": 0.80,
+}
+
+
+def get_force_stop_jerk_scale(car_params):
+  fingerprint = str(getattr(car_params, "carFingerprint", ""))
+  return FORCE_STOP_JERK_SCALE_OVERRIDES.get(fingerprint, FORCE_STOP_JERK_SCALE)
 
 
 def _sanitize_json_value(value):
@@ -95,6 +112,7 @@ class StarPilotPlanner:
     self.radarless_follow_hold_until = 0.0
 
   def shutdown(self):
+    self.starpilot_vcruise.csc.flush_data()
     self.starpilot_vcruise.slc.shutdown()
     self.starpilot_weather.executor.shutdown(wait=False, cancel_futures=True)
 
@@ -108,12 +126,6 @@ class StarPilotPlanner:
       v_cruise_kph += starpilot_toggles.set_speed_offset
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
     v_ego = max(sm["carState"].vEgo, 0)
-
-    if controls_enabled:
-      self.starpilot_acceleration.update(v_ego, sm, starpilot_toggles)
-    else:
-      self.starpilot_acceleration.max_accel = 0
-      self.starpilot_acceleration.min_accel = 0
 
     gps_location = sm[self.gps_location_service]
     self.gps_position = {
@@ -152,17 +164,19 @@ class StarPilotPlanner:
     self.lateral_acceleration = v_ego**2 * sm["controlsState"].curvature
     self.driving_in_curve = abs(self.lateral_acceleration) >= MINIMUM_LATERAL_ACCELERATION
 
+    CS = sm["carState"]
+    blinker_on = CS.leftBlinker or CS.rightBlinker
+    signal_pause = blinker_on and starpilot_toggles.pause_lateral_below_signal
+
     self.lateral_check = v_ego >= starpilot_toggles.pause_lateral_below_speed
-    self.lateral_check |= not (sm["carState"].leftBlinker or sm["carState"].rightBlinker) and starpilot_toggles.pause_lateral_below_signal
-    self.lateral_check |= sm["carState"].standstill
+    self.lateral_check |= not blinker_on and starpilot_toggles.pause_lateral_below_signal
+    self.lateral_check |= CS.standstill and not signal_pause
     self.lateral_check &= not sm["starpilotCarState"].pauseLateral
 
     # Blinker-based lateral resume delay: after blinker turns off, delay lateral
     # resumption if the vehicle went below half the pause speed during the blinker.
     # This lets the driver manually straighten the wheel after a turn without
     # openpilot fighting them.
-    CS = sm["carState"]
-    blinker_on = CS.leftBlinker or CS.rightBlinker
     prev_blinker_on = self.CS_prev_left_blinker or self.CS_prev_right_blinker
 
     if blinker_on:
@@ -211,7 +225,7 @@ class StarPilotPlanner:
     conditional_tracking_active = controls_enabled or sm["starpilotCarState"].alwaysOnLateralEnabled
     if conditional_tracking_active and bool(getattr(starpilot_toggles, "conditional_experimental_mode", False)):
       # Keep CEM's filters warm in AOL so engagement can inherit the current scene.
-      self.starpilot_cem.update(v_ego, sm, starpilot_toggles)
+      self.starpilot_cem.update(v_ego, sm, starpilot_toggles, v_cruise)
       self.starpilot_ccm.experimental_mode = True
     elif conditional_tracking_active and bool(getattr(starpilot_toggles, "conditional_chill_mode", False)):
       self.starpilot_ccm.update(v_ego, v_cruise, sm, starpilot_toggles)
@@ -223,6 +237,14 @@ class StarPilotPlanner:
       self.starpilot_cem.stop_sign_and_light(v_ego, sm, PLANNER_TIME - 2)
 
     self.v_cruise = self.starpilot_vcruise.update(controls_enabled, now, time_validated, v_cruise, v_ego, sm, starpilot_toggles)
+
+    if controls_enabled:
+      self.starpilot_acceleration.update(v_ego, sm, starpilot_toggles)
+      if self.starpilot_acceleration.pulse_glide_target is not None:
+        self.v_cruise = self.starpilot_acceleration.pulse_glide_target
+    else:
+      self.starpilot_acceleration.max_accel = 0
+      self.starpilot_acceleration.min_accel = 0
 
     self.starpilot_events.update(controls_enabled, v_cruise, sm, starpilot_toggles)
 
@@ -282,7 +304,22 @@ class StarPilotPlanner:
     starpilot_plan_send.valid = sm.all_checks(service_list=["carState", "controlsState", "selfdriveState", "radarState"])
     starpilotPlan = starpilot_plan_send.starpilotPlan
 
-    starpilotPlan.accelerationJerk = float(A_CHANGE_COST * self.starpilot_following.acceleration_jerk)
+    # While committed to a Force Stop, cut the MPC's accel-change penalty so terminal
+    # braking can ramp faster. 0.32 lands near 40, what long_mpc uses in blended mode.
+    try:
+      car_params = sm["carParams"]
+    except (KeyError, IndexError, TypeError, AttributeError):
+      car_params = None
+
+    # Also while the far-approach envelope is running: at onset the ramp reaches only
+    # ~-0.5 m/s^2 after a second, so the first seconds of a detected red are mostly lost.
+    if self.starpilot_vcruise.forcing_stop or self.starpilot_vcruise.approach_stop_length > 0.0:
+      jerk_scale = get_force_stop_jerk_scale(car_params)
+    elif self.tracking_lead:
+      jerk_scale = get_lead_follow_jerk_scale(car_params)
+    else:
+      jerk_scale = 1.0
+    starpilotPlan.accelerationJerk = float(A_CHANGE_COST * self.starpilot_following.acceleration_jerk * jerk_scale)
     starpilotPlan.dangerFactor = float(self.starpilot_following.danger_factor)
     starpilotPlan.dangerJerk = float(DANGER_ZONE_COST * self.starpilot_following.danger_jerk)
     starpilotPlan.speedJerk = float(J_EGO_COST * self.starpilot_following.speed_jerk)
@@ -293,7 +330,11 @@ class StarPilotPlanner:
     starpilotPlan.cscTraining = self.starpilot_vcruise.csc.enable_training
 
     starpilotPlan.desiredFollowDistance = int(self.starpilot_following.desired_follow_distance)
-    starpilotPlan.disableThrottle = self.starpilot_following.disable_throttle
+    starpilotPlan.disableThrottle = (
+      self.starpilot_following.disable_throttle or
+      self.starpilot_acceleration.pulse_glide_coasting
+    )
+    starpilotPlan.pulseGlideCoasting = self.starpilot_acceleration.pulse_glide_coasting
     starpilotPlan.trackingLead = self.tracking_lead
 
     conditional_experimental_mode = False
@@ -306,6 +347,7 @@ class StarPilotPlanner:
 
     starpilotPlan.forcingStop = self.starpilot_vcruise.forcing_stop
     starpilotPlan.forcingStopLength = self.starpilot_vcruise.tracked_model_length
+    starpilotPlan.approachStopLength = float(self.starpilot_vcruise.approach_stop_length)
     starpilotPlan.stopSignConfirmed = self.starpilot_vcruise.stop_sign_confirmed
 
     starpilotPlan.starpilotEvents = self.starpilot_events.events.to_msg()

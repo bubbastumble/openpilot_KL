@@ -15,7 +15,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.lead_behavior import get_tracked_lead_catchup_bias, is_radarless_matched_follow_window
 # WARNING: imports outside of constants will not trigger a rebuild
-from openpilot.selfdrive.modeld.constants import index_function
+from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
 
 if __name__ == '__main__':  # generating code
   from openpilot.third_party.acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -78,7 +78,7 @@ FAR_RADAR_LEAD_ACCEL_TAPER_MIN_GAP_EXCESS = 8.0
 FAR_RADAR_LEAD_ACCEL_TAPER_MIN_GAP_GAIN = 0.25
 FAR_RADAR_LEAD_ACCEL_TAPER_FULL_GAP_EXCESS = 25.0
 FAR_RADAR_LEAD_ACCEL_TAPER_FULL_GAP_GAIN = 0.9
-STABLE_FOLLOW_CRUISE_MIN_SPEED = 12.0
+STABLE_FOLLOW_CRUISE_MIN_SPEED = 8.0
 STABLE_FOLLOW_CRUISE_HYSTERESIS_MIN = 4.0
 STABLE_FOLLOW_CRUISE_HYSTERESIS_GAIN = 0.14
 STABLE_FOLLOW_CRUISE_MAX_REL_SPEED = 2.5
@@ -92,7 +92,7 @@ STABLE_FOLLOW_CRUISE_PULLAWAY_MIN_HEADWAY_MARGIN = -0.10
 STABLE_FOLLOW_CRUISE_PULLAWAY_HYSTERESIS_MAX = 1.75
 VISION_FOLLOW_CRUISE_HOLD_MIN_MODEL_PROB = 0.95
 VISION_FOLLOW_CRUISE_HOLD_MAX_CRUISE_ADVANTAGE = 2.0
-NEAR_DUPLICATE_LEAD_SOURCE_MIN_SPEED = 20.0
+NEAR_DUPLICATE_LEAD_SOURCE_MIN_SPEED = 4.0
 NEAR_DUPLICATE_IDENTICAL_RADAR_SOURCE_MIN_SPEED = 10.0
 NEAR_DUPLICATE_LEAD_SOURCE_MIN_MODEL_PROB = 0.9
 NEAR_DUPLICATE_LEAD_SOURCE_MAX_LEAD_BRAKE = 0.35
@@ -138,6 +138,8 @@ LEAD_ACCEL_TAU = 1.5
 FCW_MIN_MODEL_PROB = 0.9
 FCW_MIN_CLOSING_SPEED = 0.5
 FCW_MAX_TTC = 4.0
+MODEL_LEAD_TRAJECTORY_MAX_LEAD_BRAKE = 0.5
+MODEL_LEAD_TRAJECTORY_MAX_CLOSING_TTC = 7.0
 
 
 # Fewer timestamps don't hurt performance and lead to
@@ -149,8 +151,60 @@ T_IDXS_LST = [index_function(idx, max_val=MAX_T, max_idx=N) for idx in range(N+1
 T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
+LEAD_T_IDXS_MODEL = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 6.0
+
+
+def build_model_lead_trajectory(model_lead, radar_lead, v_ego):
+  """Build a model-predicted lead path while preserving the raw h=0 anchor."""
+  if model_lead is None or radar_lead is None or not bool(getattr(radar_lead, "status", False)):
+    return None
+
+  try:
+    if float(model_lead.prob) <= 0.5:
+      return None
+    model_x = np.asarray(model_lead.x, dtype=np.float64)
+    model_v = np.asarray(model_lead.v, dtype=np.float64)
+  except (AttributeError, TypeError, ValueError):
+    return None
+
+  expected_len = len(LEAD_T_IDXS_MODEL)
+  if model_x.shape != (expected_len,) or model_v.shape != (expected_len,):
+    return None
+  if not np.all(np.isfinite(model_x)) or not np.all(np.isfinite(model_v)):
+    return None
+
+  raw_d_rel = float(getattr(radar_lead, "dRel", float("nan")))
+  raw_v_lead = float(getattr(radar_lead, "vLead", float("nan")))
+  if not np.isfinite(raw_d_rel) or not np.isfinite(raw_v_lead):
+    return None
+
+  # The model path is a comfort prediction, not the raw safety measurement.
+  # When the measured lead is already braking or the gap is closing quickly,
+  # keep the legacy raw-lead path so an optimistic model horizon cannot delay
+  # the first braking response.
+  raw_lead_brake = max(0.0, -float(getattr(radar_lead, "aLeadK", 0.0)))
+  closing_speed = max(0.0, float(v_ego) - raw_v_lead)
+  ttc = raw_d_rel / max(closing_speed, 1e-3) if closing_speed > 0.1 else float("inf")
+  if (raw_lead_brake > MODEL_LEAD_TRAJECTORY_MAX_LEAD_BRAKE or
+      (closing_speed > 0.75 and ttc < MODEL_LEAD_TRAJECTORY_MAX_CLOSING_TTC)):
+    return None
+
+  # The model contributes future deltas only. This preserves raw lead source
+  # selection and keeps the current lead distance/speed safety anchor intact.
+  x_lead_traj = raw_d_rel + (model_x - model_x[0])
+  v_lead_traj = raw_v_lead + (model_v - model_v[0])
+  v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
+
+  # Match the existing MPC convergence guard using the physical brake limit.
+  v_ego = float(v_ego)
+  min_x_lead = ((v_ego + v_lead_traj[0]) / 2.0) * (v_ego - v_lead_traj[0]) / (-ACCEL_MIN * 2.0)
+  x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
+
+  x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
+  v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
+  return np.column_stack((x_lead_mpc, v_lead_mpc))
 
 
 def should_trigger_planner_fcw(lead, v_ego: float) -> bool:
@@ -383,6 +437,7 @@ class LongitudinalMpc:
     self.current_filter_time = LEAD_FILTER_TIME_LOW
     self.lead_a_filter = FirstOrderFilter(0.0, self.current_filter_time, self.dt)
     self.lead_v_filter = FirstOrderFilter(0.0, self.current_filter_time, self.dt)
+    self.duplicate_lead_x_filters = [FirstOrderFilter(0.0, 0.0, self.dt, initialized=False) for _ in range(2)]
     self.duplicate_lead_a_filters = [FirstOrderFilter(0.0, 0.0, self.dt, initialized=False) for _ in range(2)]
     self.duplicate_lead_v_filters = [FirstOrderFilter(0.0, 0.0, self.dt, initialized=False) for _ in range(2)]
     # Slew-limited filter factor to avoid abrupt 0.50↔1.00 jumps
@@ -413,6 +468,8 @@ class LongitudinalMpc:
     self.solver.cost_set(N, "yref", self.yref[N][:COST_E_DIM])
     self.x_sol = np.zeros((N+1, X_DIM))
     self.u_sol = np.zeros((N,1))
+    self.lead_xv_0 = np.zeros((N+1, 2))
+    self.lead_xv_1 = np.zeros((N+1, 2))
     self.params = np.zeros((N+1, PARAM_DIM))
     for i in range(N+1):
       self.solver.set(i, 'x', np.zeros(X_DIM))
@@ -426,7 +483,7 @@ class LongitudinalMpc:
     self.time_linearization = 0.0
     self.time_integrator = 0.0
     self.x0 = np.zeros(X_DIM)
-    for lead_filter in (*self.duplicate_lead_a_filters, *self.duplicate_lead_v_filters):
+    for lead_filter in (*self.duplicate_lead_x_filters, *self.duplicate_lead_a_filters, *self.duplicate_lead_v_filters):
       lead_filter.x = 0.0
       lead_filter.initialized = False
     self.set_weights()
@@ -570,9 +627,14 @@ class LongitudinalMpc:
     return lead_xv
 
   def process_lead(self, lead, tracking_lead=True, t_follow=None, *, lead_index=0,
-                   smooth_duplicate_vision=False):
+                   smooth_duplicate_vision=False, model_lead=None):
     v_ego = self.x0[1]
     lead_active = lead is not None and lead.status and tracking_lead
+    if lead_active:
+      model_lead_xv = build_model_lead_trajectory(model_lead, lead, v_ego)
+      if model_lead_xv is not None:
+        return model_lead_xv
+
     if lead_active:
       x_lead = lead.dRel
       v_lead = lead.vLead
@@ -604,10 +666,17 @@ class LongitudinalMpc:
       filter_time = max(filter_time, DUPLICATE_VISION_LEAD_FILTER_TIME)
       filter_time *= self.filter_time_factor
 
+      x_filter = self.duplicate_lead_x_filters[lead_index]
       a_filter = self.duplicate_lead_a_filters[lead_index]
       v_filter = self.duplicate_lead_v_filters[lead_index]
+      x_filter.update_alpha(filter_time)
       a_filter.update_alpha(filter_time)
       v_filter.update_alpha(filter_time)
+      if x_filter.initialized and x_lead <= x_filter.x:
+        x_filter.x = x_lead
+      else:
+        x_filter.update(x_lead)
+      x_lead = x_filter.x
       a_lead = a_filter.update(a_lead)
       v_lead = v_filter.update(v_lead)
     else:
@@ -616,6 +685,7 @@ class LongitudinalMpc:
       self.lead_v_filter.update(v_lead)
       a_lead = self.lead_a_filter.x
       v_lead = self.lead_v_filter.x
+      self.duplicate_lead_x_filters[lead_index].initialized = False
       self.duplicate_lead_a_filters[lead_index].initialized = False
       self.duplicate_lead_v_filters[lead_index].initialized = False
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau, v_ego)
@@ -777,7 +847,7 @@ class LongitudinalMpc:
 
   def get_vision_follow_cruise_hold(self, prev_source, lead_one, lead_two,
                                     lead_0_obstacle, lead_1_obstacle, cruise_obstacle,
-                                    v_ego, t_follow, tracking_lead):
+                                    v_ego, t_follow, tracking_lead, *, early_follow=False):
     if not tracking_lead or prev_source not in ("lead0", "lead1"):
       return None
 
@@ -786,7 +856,24 @@ class LongitudinalMpc:
       return None
     if float(getattr(prev_lead, "modelProb", 0.0)) < VISION_FOLLOW_CRUISE_HOLD_MIN_MODEL_PROB:
       return None
-    if self.get_stable_follow_cruise_hysteresis(prev_lead, v_ego, t_follow) <= 0.0:
+    if early_follow:
+      # Silverado admits a credible centered vision lead before it reaches the
+      # normal matched-follow window. Hold that lead through the harmless
+      # cruise/lead crossover, but never through a closing or braking lead.
+      relative_speed = float(v_ego) - float(prev_lead.vLead)
+      actual_headway = float(prev_lead.dRel) / max(float(v_ego), 1e-3)
+      if (
+        float(v_ego) < 18.0 or
+        abs(relative_speed) > 2.5 or
+        actual_headway < 0.95 or
+        actual_headway > 2.35 or
+        float(prev_lead.dRel) > 130.0 or
+        abs(float(getattr(prev_lead, "yRel", 0.0))) > 1.2 or
+        max(0.0, -float(getattr(prev_lead, "aLeadK", 0.0))) > 0.35 or
+        float(getattr(prev_lead, "modelProb", 0.0)) < 0.95
+      ):
+        return None
+    elif self.get_stable_follow_cruise_hysteresis(prev_lead, v_ego, t_follow) <= 0.0:
       return None
 
     prev_lead_obstacle = float(lead_0_obstacle if prev_source == "lead0" else lead_1_obstacle)
@@ -835,21 +922,33 @@ class LongitudinalMpc:
 
   def update(self, radarstate, v_cruise, x, v, a, j, danger_factor, t_follow,
              personality=log.LongitudinalPersonality.standard, tracking_lead=True,
-             optional_far_lead_comfort=True, smooth_duplicate_vision=False):
+             optional_far_lead_comfort=True, smooth_duplicate_vision=False,
+             stop_x=None, silverado_early_follow=False, modelV2=None,
+             lead_obstacle_bias=(0.0, 0.0), tracked_lead_catchup_headway_margins=None,
+             tracked_lead_catchup_bias_gain=None, tracked_lead_catchup_bias_cap=None,
+             tracked_lead_catchup_speed_range=None, tracked_lead_catchup_fade_margins=None,
+             tracked_lead_catchup_cruise_error_full=None):
     v_ego = self.x0[1]
     lead_one = radarstate.leadOne
     lead_two = radarstate.leadTwo
     self.status = tracking_lead and (lead_one.status or lead_two.status)
+    model_leads = getattr(modelV2, "leadsV3", ()) if modelV2 is not None else ()
     lead_xv_0 = self.process_lead(lead_one, tracking_lead, t_follow=t_follow, lead_index=0,
-                                  smooth_duplicate_vision=smooth_duplicate_vision)
+                                  smooth_duplicate_vision=smooth_duplicate_vision,
+                                  model_lead=model_leads[0] if len(model_leads) > 0 else None)
     lead_xv_1 = self.process_lead(lead_two, tracking_lead, t_follow=t_follow, lead_index=1,
-                                  smooth_duplicate_vision=smooth_duplicate_vision)
+                                  smooth_duplicate_vision=smooth_duplicate_vision,
+                                  model_lead=model_leads[1] if len(model_leads) > 1 else None)
+    self.lead_xv_0 = lead_xv_0
+    self.lead_xv_1 = lead_xv_1
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+    lead_0_obstacle -= float(lead_obstacle_bias[0])
+    lead_1_obstacle -= float(lead_obstacle_bias[1])
 
     self.params[:,0] = ACCEL_MIN
     self.params[:,1] = max(0.0, self.max_a)
@@ -873,9 +972,27 @@ class LongitudinalMpc:
           cruise_obstacle += self.get_stable_follow_cruise_hysteresis(lead_one, v_ego, t_follow)
         elif prev_source == 'lead1':
           cruise_obstacle += self.get_stable_follow_cruise_hysteresis(lead_two, v_ego, t_follow)
-      if optional_far_lead_comfort and tracking_lead and lead_one.status:
+      crv_tracked_lead_tune = tracked_lead_catchup_bias_cap is not None
+      if (optional_far_lead_comfort and tracking_lead and lead_one.status and
+          (not crv_tracked_lead_tune or bool(getattr(lead_one, "radar", False)))):
         desired_gap = desired_follow_distance(v_ego, lead_one.vLead, t_follow)
         closing_speed = max(0.0, v_ego - lead_one.vLead)
+        catchup_kwargs = {}
+        if tracked_lead_catchup_headway_margins is not None:
+          catchup_kwargs = {
+            "min_headway_margin": tracked_lead_catchup_headway_margins[0],
+            "full_headway_margin": tracked_lead_catchup_headway_margins[1],
+          }
+        if tracked_lead_catchup_bias_gain is not None:
+          catchup_kwargs["bias_gain"] = tracked_lead_catchup_bias_gain
+        if tracked_lead_catchup_bias_cap is not None:
+          catchup_kwargs["bias_cap"] = tracked_lead_catchup_bias_cap
+        if tracked_lead_catchup_speed_range is not None:
+          catchup_kwargs["speed_range"] = tracked_lead_catchup_speed_range
+        if tracked_lead_catchup_fade_margins is not None:
+          catchup_kwargs["fade_margins"] = tracked_lead_catchup_fade_margins
+        if tracked_lead_catchup_cruise_error_full is not None:
+          catchup_kwargs["cruise_error_full"] = tracked_lead_catchup_cruise_error_full
         cruise_obstacle += get_tracked_lead_catchup_bias(
           v_ego,
           lead_one.dRel,
@@ -883,6 +1000,7 @@ class LongitudinalMpc:
           closing_speed,
           v_cruise=v_cruise,
           y_rel=float(getattr(lead_one, "yRel", 0.0)),
+          **catchup_kwargs,
         )
       if optional_far_lead_comfort:
         cruise_obstacle += self.get_identical_radar_duplicate_cruise_bias(lead_one, lead_two, v_ego, t_follow)
@@ -890,6 +1008,11 @@ class LongitudinalMpc:
         lead_0_bias, lead_1_bias = self.get_near_duplicate_lead_source_hysteresis(prev_source, lead_one, lead_two, v_ego)
         lead_0_obstacle = lead_0_obstacle + lead_0_bias
         lead_1_obstacle = lead_1_obstacle + lead_1_bias
+      # A forced stop is a position constraint, not a speed one. Folded in here rather than
+      # as a 4th column so the SOURCES[argmin] below keeps working. Lets the solver plan the
+      # stop directly instead of chasing a descending speed ceiling with a persistent lag.
+      if stop_x is not None:
+        cruise_obstacle = np.minimum(cruise_obstacle, stop_x)
       x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
       candidate_source = SOURCES[np.argmin(x_obstacles[0])]
       sticky_source = None
@@ -924,6 +1047,7 @@ class LongitudinalMpc:
               v_ego,
               t_follow,
               tracking_lead,
+              early_follow=silverado_early_follow,
             )
       self.source = sticky_source or candidate_source
 
@@ -939,6 +1063,8 @@ class LongitudinalMpc:
       xforward = ((v[1:] + v[:-1]) / 2) * (T_IDXS[1:] - T_IDXS[:-1])
       x = np.cumsum(np.insert(xforward, 0, x[0]))
 
+      if stop_x is not None:
+        cruise_target = np.minimum(cruise_target, stop_x)
       x_and_cruise = np.column_stack([x, cruise_target])
       x = np.min(x_and_cruise, axis=1)
 

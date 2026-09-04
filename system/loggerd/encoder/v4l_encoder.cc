@@ -2,6 +2,7 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <utility>
 
 #include "system/loggerd/encoder/v4l_encoder.h"
 #include "common/util.h"
@@ -119,12 +120,17 @@ void V4LEncoder::dequeue_handler(V4LEncoder *e) {
       } else if (flags & V4L2_QCOM_BUF_FLAG_CODECCONFIG) {
         // save header
         header = kj::heapArray<capnp::byte>(buf, bytesused);
+        if (e->packet_callback) e->packet_callback(header.begin(), header.size(), ts, true, false);
       } else {
         VisionIpcBufExtra extra = e->extras.pop();
         assert(extra.timestamp_eof/1000 == ts); // stay in sync
         frame_id = extra.frame_id;
         ++idx;
-        e->publisher_publish(e->segment_num, idx, extra, flags, header, kj::arrayPtr<capnp::byte>(buf, bytesused));
+        if (e->packet_callback) {
+          e->packet_callback(buf, bytesused, ts, false, flags & V4L2_BUF_FLAG_KEYFRAME);
+        } else {
+          e->publisher_publish(e->segment_num, idx, extra, flags, header, kj::arrayPtr<capnp::byte>(buf, bytesused));
+        }
       }
 
       if (env_debug_encoder) {
@@ -139,13 +145,19 @@ void V4LEncoder::dequeue_handler(V4LEncoder *e) {
     if (pfd.revents & POLLOUT) {
       unsigned int index;
       dequeue_buffer(e->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &index);
+      VisionBuf *input_buf = e->input_bufs[index].exchange(nullptr);
+      if (input_buf && e->input_done_callback) e->input_done_callback(input_buf);
       e->free_buf_in.push(index);
     }
   }
 }
 
 V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_height)
-    : VideoEncoder(encoder_info, in_width, in_height) {
+    : V4LEncoder(encoder_info, in_width, in_height, Options{}) {}
+
+V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_height, Options options)
+    : VideoEncoder(encoder_info, in_width, in_height), packet_callback(std::move(options.packet_callback)),
+      input_done_callback(std::move(options.input_done_callback)) {
   fd = HANDLE_EINTR(open("/dev/v4l/by-path/platform-aa00000.qcom_vidc-video-index1", O_RDWR|O_NONBLOCK));
   assert(fd >= 0);
 
@@ -156,6 +168,7 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
   assert(strcmp((const char *)cap.card, "msm_vidc_venc") == 0);
 
   EncoderSettings encoder_settings = encoder_info.get_settings(in_width);
+  current_bitrate = encoder_settings.bitrate;
   bool is_h265 = encoder_settings.encode_type == cereal::EncodeIndex::Type::FULL_H_E_V_C;
 
   struct v4l2_format fmt_out = {
@@ -193,7 +206,7 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
       .pix_mp = {
         .width = (unsigned int)in_width,
         .height = (unsigned int)in_height,
-        .pixelformat = V4L2_PIX_FMT_NV12,
+        .pixelformat = options.input_format,
         .field = V4L2_FIELD_ANY,
         .colorspace = V4L2_COLORSPACE_470_SYSTEM_BG,
       }
@@ -219,6 +232,13 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
     for (auto ctrl : ctrls) {
       util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL failed");
     }
+  }
+  if (options.max_performance) {
+    struct v4l2_control ctrl = {
+      .id = V4L2_CID_MPEG_VIDC_VIDEO_PRIORITY,
+      .value = V4L2_MPEG_VIDC_VIDEO_PRIORITY_REALTIME_ENABLE,
+    };
+    util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL offline encode failed");
   }
 
   if (is_h265) {
@@ -281,6 +301,7 @@ int V4LEncoder::encode_frame(VisionBuf* buf, VisionIpcBufExtra *extra) {
 
   // reserve buffer
   int buffer_in = free_buf_in.pop();
+  input_bufs[buffer_in].store(buf);
 
   // push buffer
   extras.push(*extra);
@@ -303,6 +324,36 @@ void V4LEncoder::encoder_close() {
     assert(extras.empty());
   }
   this->is_open = false;
+}
+
+void V4LEncoder::set_bitrate(int bitrate) {
+  if (bitrate == current_bitrate) return;
+  if (bitrate <= 0) {
+    LOGE("invalid livestream encoder bitrate %d", bitrate);
+    return;
+  }
+
+  struct v4l2_control ctrl = {
+    .id = V4L2_CID_MPEG_VIDEO_BITRATE,
+    .value = bitrate,
+  };
+
+  if (util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl) == -1) {
+    LOGE("failed to update %s bitrate to %d", encoder_info.publish_name, bitrate);
+    return;
+  }
+  current_bitrate = bitrate;
+}
+
+void V4LEncoder::request_keyframe() {
+  struct v4l2_control ctrl = {
+    .id = V4L2_CID_MPEG_VIDC_VIDEO_REQUEST_IFRAME,
+    .value = 1,
+  };
+
+  if (util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl) == -1) {
+    LOGE("failed to request keyframe for %s", encoder_info.publish_name);
+  }
 }
 
 V4LEncoder::~V4LEncoder() {

@@ -5,7 +5,8 @@ from enum import IntEnum
 
 import pyray as rl
 
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.common.params import Params
+from openpilot.selfdrive.ui.lib.ui_param_cache import shared_ui_params
 from openpilot.starpilot.common.starpilot_variables import update_starpilot_toggles
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.application import gui_app
@@ -13,58 +14,50 @@ from openpilot.system.ui.widgets import DialogResult, Widget
 from openpilot.system.ui.widgets.option_dialog import MultiOptionDialog
 from openpilot.selfdrive.ui.layouts.settings.starpilot.aethergrid import TileGrid, HubTile, ToggleTile, ValueTile, SliderTile, SPACING, AetherSliderDialog, AetherListColors
 from openpilot.selfdrive.ui.layouts.settings.starpilot.sectioned_panel import SectionedTileLayout, TileSection
-import time
 
 
-class SettingsParamsWrapper:
-  """
-  Proxy for ui_state.params. Relies on CachedParams for global TTL caching.
-  Intercepts UI writes (put/remove) to trigger system migrations automatically.
-  """
+class FrameCachedParams:
   def __init__(self):
-    self._params = ui_state.params
+    self._cache = shared_ui_params()
 
-  # --- Read Operations (Forwarded directly to global TTL cache) ---
   def get(self, key, **kwargs):
-    return self._params.get(key, **kwargs)
+    return self._cache.get(key, **kwargs)
 
   def get_bool(self, key, **kwargs):
-    return self._params.get_bool(key, **kwargs)
+    return self._cache.get_bool(key, **kwargs)
 
   def get_int(self, key, **kwargs):
-    return self._params.get_int(key, **kwargs)
+    return self._cache.get_int(key, **kwargs)
 
   def get_float(self, key, **kwargs):
-    return self._params.get_float(key, **kwargs)
+    return self._cache.get_float(key, **kwargs)
 
   def _notify_changed(self):
-    # Triggers backend state sync when UI settings are modified
+    self._cache.invalidate()
     update_starpilot_toggles()
 
-  # --- Write Operations (Triggers side-effects) ---
   def put(self, key, val, **kwargs):
-    self._params.put(key, val, **kwargs)
+    self._cache.put(key, val, **kwargs)
     self._notify_changed()
 
   def put_bool(self, key, val, **kwargs):
-    self._params.put_bool(key, val, **kwargs)
+    self._cache.put_bool(key, val, **kwargs)
     self._notify_changed()
 
   def put_int(self, key, val, **kwargs):
-    self._params.put_int(key, val, **kwargs)
+    self._cache.put_int(key, val, **kwargs)
     self._notify_changed()
 
   def put_float(self, key, val, **kwargs):
-    self._params.put_float(key, val, **kwargs)
+    self._cache.put_float(key, val, **kwargs)
     self._notify_changed()
 
   def remove(self, key):
-    self._params.remove(key)
+    self._cache.remove(key)
     self._notify_changed()
 
-  # Safety net for any newly added parameter methods
   def __getattr__(self, name):
-    return getattr(self._params, name)
+    return getattr(self._cache, name)
 
 
 class StarPilotPanelType(IntEnum):
@@ -78,6 +71,7 @@ class StarPilotPanelType(IntEnum):
     VISUALS = 8
     VEHICLE = 10
     SYSTEM = 12
+    NAVIGATION = 13
 
 
 @dataclass
@@ -90,8 +84,8 @@ class StarPilotPanelInfo:
 class StarPilotPanel(Widget):
     def __init__(self):
         super().__init__()
-        self._params_memory = ui_state.params_memory
-        self._params = SettingsParamsWrapper()
+        self._params_memory = Params(memory=True)
+        self._params = FrameCachedParams()
         self._navigate_callback: Callable | None = None
         self._back_callback: Callable | None = None
         self._current_sub_panel = ""
@@ -361,7 +355,7 @@ class _SettingsPage(StarPilotPanel):
   def _show_labeled_select(self, title, key, options, current_value):
     """Integer-based multi-option selector with label/value pairs (puts int).
 
-    Mirrors Qt's ButtonParamControl: resolve by index so no KeyError is possible.
+    Resolve by index so no KeyError is possible.
     """
     option_labels = [tr(label) for _, label in options]
     option_values = [value for value, _ in options]
