@@ -90,7 +90,7 @@ class VCruiseHelper:
     self.v_cruise_kph_last = self.v_cruise_kph
 
     if CS.cruiseState.available:
-      if self.gm_cc_only or self.redneck_non_pcm or not self.CP.pcmCruise:
+      if self.gm_cc_only or (self.redneck_non_pcm and getattr(starpilot_toggles, "redneck_cruise", True)) or not self.CP.pcmCruise:
         # if stock cruise is completely disabled, then we can use our own set speed logic
         self._update_v_cruise_non_pcm(CS, enabled, is_metric, speed_limit_changed, starpilot_toggles, starpilot_car_state,
                                       slc_target_with_offset)

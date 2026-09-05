@@ -58,8 +58,8 @@ def test_galaxy_layout_contains_basic_mode_controls():
   } <= sections["Longitudinal (Speed & Following)"].keys()
   assert "Vision Speed Limits" in sections
   assert "VisionSpeedLimitDetection" not in sections["Longitudinal (Speed & Following)"]
-  assert "RedneckCruise" not in sections["Longitudinal (Speed & Following)"].keys()
-  assert sections["Developer"]["RedneckCruise"]["parent_key"] == "GalaxyDeveloperMode"
+  assert "RedneckCruise" in sections["Longitudinal (Speed & Following)"].keys()
+  assert sections["Longitudinal (Speed & Following)"]["RedneckCruise"]["parent_key"] == "SpeedLimitController"
   assert sections["Longitudinal (Speed & Following)"]["PulseGlideSpeedDelta"]["parent_key"] == "QOLLongitudinal"
   assert sections["Longitudinal (Speed & Following)"]["PulseGlideSpeedDelta"]["settings_tier"] == "advanced"
   assert "PulseGlideSpeedDelta" not in sections["Developer"]
@@ -257,7 +257,7 @@ def test_requested_simple_and_advanced_settings_tiers():
   assert developer["ForceOffroad"]["requires_parked"] is True
   assert developer["ForceOffroad"]["settings_tier"] == "advanced"
   assert developer["DeveloperUI"]["settings_tier"] == "advanced"
-  assert developer["RedneckCruise"]["settings_tier"] == "advanced"
+  assert sections["Longitudinal (Speed & Following)"]["RedneckCruise"]["settings_tier"] == "simple"
   assert sections["Visual (Display & UI)"]["DisableWideRoad"]["settings_tier"] == "advanced"
 
 

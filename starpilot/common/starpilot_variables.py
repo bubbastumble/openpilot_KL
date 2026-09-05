@@ -672,14 +672,12 @@ class StarPilotVariables:
     toggle.experimental_mode_available = (
       toggle.openpilot_longitudinal or lateral_only_experimental_available(CP)
     )
-    if not toggle.redneck_cruise_available or (toggle.openpilot_longitudinal and FPCP.pcmCruiseSpeed):
+    if not toggle.redneck_cruise_available or toggle.openpilot_longitudinal:
       self.params.put_bool("RedneckCruise", False)
     toggle.redneck_cruise = self.get_value(
       "RedneckCruise",
       condition=toggle.redneck_cruise_available and not toggle.openpilot_longitudinal,
     )
-    if toggle.redneck_cruise_available and not FPCP.pcmCruiseSpeed:
-      toggle.redneck_cruise = True
     pcm_cruise = CP.pcmCruise
     prohibited_main_aol = not toggle.openpilot_longitudinal and hyundai_can_use_lkas_for_aol
     startAccel = CP.startAccel

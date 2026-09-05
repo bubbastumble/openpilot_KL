@@ -225,8 +225,7 @@ class CarInterfaceBase(ABC):
 
         if candidate in CUSW_CARS:
           fp_ret.redneckCruiseAvailable = True
-          if params.get_bool("RedneckCruise"):
-            fp_ret.pcmCruiseSpeed = False
+          fp_ret.pcmCruiseSpeed = False
 
       elif platform in GM:
         fp_ret.canUsePedal = True
