@@ -51,10 +51,6 @@ def select_redneck_target_speed(v_cruise_kph: float, speed_cluster_ms: float,
   target_speed_ms = float(speed_cluster_ms)
   if slc_target_speed_ms > 0:
     target_speed_ms = float(slc_target_speed_ms)
-    # SLC is an upper bound for the button-spammed stock setpoint. A driver-set
-    # speed below the posted target must still be able to slow the car down.
-    if 0 < v_cruise_kph < V_CRUISE_UNSET:
-      target_speed_ms = min(target_speed_ms, float(v_cruise_kph) * CV.KPH_TO_MS)
   elif v_cruise_kph > 0:
     target_speed_ms = float(v_cruise_kph) * CV.KPH_TO_MS
   elif starpilot_target_speed_ms > 0:
@@ -256,7 +252,7 @@ class RedneckCruise:
 
   def run(self, CS: car.CarState, CC: car.CarControl, v_target_ms: float, is_metric: bool,
           lead_present: bool = False) -> tuple[int, int]:
-    if self.FPCP.pcmCruiseSpeed or not self.FPCP.redneckCruiseAvailable:
+    if not getattr(self.FPCP, "redneckCruiseAvailable", False):
       self._reset()
       return SEND_BUTTON_NONE, 0
 

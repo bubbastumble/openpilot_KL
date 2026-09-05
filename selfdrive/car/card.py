@@ -203,7 +203,7 @@ class Car:
 
     self.mock_carstate = MockCarState()
     self.v_cruise_helper = VCruiseHelper(self.CP, self.FPCP)
-    self.redneck_cruise = RedneckCruise(self.CP, self.FPCP) if self.CP.brand in ("hyundai", "chrysler") and self.FPCP.redneckCruiseAvailable and not self.FPCP.pcmCruiseSpeed else None
+    self.redneck_cruise = RedneckCruise(self.CP, self.FPCP) if self.CP.brand in ("hyundai", "chrysler") and getattr(self.FPCP, "redneckCruiseAvailable", False) else None
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.safe_mode = self.params.get_bool("SafeMode")
@@ -474,7 +474,9 @@ class Car:
     self.CI.CS.openpilot_lead_rel_speed = lead_rel_speed
 
   def _update_redneck_cruise(self, CS: car.CarState, CC: car.CarControl) -> None:
-    if self.redneck_cruise is None:
+    if self.redneck_cruise is None or not getattr(self.starpilot_toggles, "redneck_cruise", False):
+      self.CI.CS.redneck_send_button = 0
+      self.CI.CS.redneck_v_target = 0
       return
 
     v_target_ms, lead_present = self._get_redneck_target_speed(CS, CC)
