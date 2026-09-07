@@ -20,13 +20,13 @@ LEAD_RECOVERY_HOLD_BUFFER_MS = 1.5 * CV.MPH_TO_MS
 LEAD_COAST_BUFFER_MS = 1.0 * CV.MPH_TO_MS
 LEAD_EXTRA_COAST_BUFFER_FACTOR = 0.6
 LEAD_EXTRA_COAST_BUFFER_MAX_MS = 3.0 * CV.MPH_TO_MS
-LEAD_EXTRA_COAST_HEADWAY_MIN_S = 1.5
-LEAD_EXTRA_COAST_HEADWAY_MAX_S = 3.0
+LEAD_EXTRA_COAST_HEADWAY_MIN_S = 1.2
+LEAD_EXTRA_COAST_HEADWAY_MAX_S = 2.2
 LEAD_CLOSING_REL_SPEED_MIN_MS = 0.5 * CV.MPH_TO_MS
-LEAD_PROACTIVE_COAST_HEADWAY_MAX_S = 4.0
+LEAD_PROACTIVE_COAST_HEADWAY_MAX_S = 2.6
 LEAD_DEPARTURE_REL_SPEED_MIN_MS = 1.0 * CV.MPH_TO_MS
-LEAD_DEPARTURE_HEADWAY_MIN_S = 1.8
-LEAD_DEPARTURE_HEADWAY_MAX_S = 4.5
+LEAD_DEPARTURE_HEADWAY_MIN_S = 1.4
+LEAD_DEPARTURE_HEADWAY_MAX_S = 3.0
 LEAD_DEPARTURE_BOOST_MIN_MS = 1.25 * CV.MPH_TO_MS
 LEAD_DEPARTURE_BOOST_MAX_MS = 3.0 * CV.MPH_TO_MS
 LEAD_DEPARTURE_BOOST_FACTOR = 0.50
@@ -51,6 +51,8 @@ def select_redneck_target_speed(v_cruise_kph: float, speed_cluster_ms: float,
   target_speed_ms = float(speed_cluster_ms)
   if slc_target_speed_ms > 0:
     target_speed_ms = float(slc_target_speed_ms)
+    if 0 < v_cruise_kph < V_CRUISE_UNSET:
+      target_speed_ms = min(target_speed_ms, float(v_cruise_kph) * CV.KPH_TO_MS)
   elif v_cruise_kph > 0:
     target_speed_ms = float(v_cruise_kph) * CV.KPH_TO_MS
   elif starpilot_target_speed_ms > 0:
