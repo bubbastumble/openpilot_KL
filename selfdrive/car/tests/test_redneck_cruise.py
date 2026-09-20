@@ -589,7 +589,12 @@ class TestCuswRedneckCruise(unittest.TestCase):
     expected_limit = 84.0 * CV.KPH_TO_MS
     self.assertAlmostEqual(expected_limit, self.card._redneck_target_speed_ms)
     self.params_memory.put_bool.assert_called_with("SLCAdoptSpeedLimit", True)
-    self.redneck_cruise.run.assert_called_once_with(cs, cc, expected_limit, True, lead_present=False)
+    self.assertEqual(1, self.redneck_cruise.run.call_count)
+    call_args, call_kwargs = self.redneck_cruise.run.call_args
+    self.assertEqual((cs, cc), call_args[:2])
+    self.assertAlmostEqual(expected_limit, call_args[2])
+    self.assertEqual(True, call_args[3])
+    self.assertEqual({"lead_present": False}, call_kwargs)
 
   def test_cusw_manual_buttons_update_target_speed(self):
     self.card._redneck_engaged_prev = True
@@ -605,7 +610,12 @@ class TestCuswRedneckCruise(unittest.TestCase):
     Car._update_redneck_cruise(self.card, cs, cc)
 
     self.assertAlmostEqual(80.0 * CV.KPH_TO_MS, self.card._redneck_target_speed_ms)
-    self.redneck_cruise.run.assert_called_once_with(cs, cc, 80.0 * CV.KPH_TO_MS, True, lead_present=False)
+    self.assertEqual(1, self.redneck_cruise.run.call_count)
+    call_args, call_kwargs = self.redneck_cruise.run.call_args
+    self.assertEqual((cs, cc), call_args[:2])
+    self.assertAlmostEqual(80.0 * CV.KPH_TO_MS, call_args[2])
+    self.assertEqual(True, call_args[3])
+    self.assertEqual({"lead_present": False}, call_kwargs)
 
   def test_cusw_bluetooth_adopt_speed_limit(self):
     self.card._redneck_engaged_prev = True
@@ -631,7 +641,12 @@ class TestCuswRedneckCruise(unittest.TestCase):
 
     expected_limit = 105.0 * CV.KPH_TO_MS
     self.assertAlmostEqual(expected_limit, self.card._redneck_target_speed_ms)
-    self.redneck_cruise.run.assert_called_once_with(cs, cc, expected_limit, True, lead_present=False)
+    self.assertEqual(1, self.redneck_cruise.run.call_count)
+    call_args, call_kwargs = self.redneck_cruise.run.call_args
+    self.assertEqual((cs, cc), call_args[:2])
+    self.assertAlmostEqual(expected_limit, call_args[2])
+    self.assertEqual(True, call_args[3])
+    self.assertEqual({"lead_present": False}, call_kwargs)
 
 
 if __name__ == "__main__":
