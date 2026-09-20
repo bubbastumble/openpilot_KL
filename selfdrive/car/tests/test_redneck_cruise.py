@@ -510,5 +510,129 @@ class TestRedneckCruise(unittest.TestCase):
     self.assertAlmostEqual(37.1 * CV.MPH_TO_MS, target_speed)
 
 
+class TestCuswRedneckCruise(unittest.TestCase):
+  def setUp(self):
+    self.redneck_cruise = MagicMock()
+    self.redneck_cruise.cruise_button_timers = {}
+    self.redneck_cruise.run.return_value = (SEND_BUTTON_NONE, 100)
+    self.params_memory = MagicMock()
+    self.params_memory.get_bool.return_value = False
+    self.sm = MagicMock()
+    self.sm.seen = {"starpilotPlan": False}
+    self.sm.valid = {"starpilotPlan": False}
+
+    self.card = SimpleNamespace(
+      CP=SimpleNamespace(carFingerprint="JEEP_CHEROKEE_5TH_GEN"),
+      CI=SimpleNamespace(CS=SimpleNamespace(redneck_send_button=0, redneck_v_target=0)),
+      redneck_cruise=self.redneck_cruise,
+      starpilot_toggles=SimpleNamespace(redneck_cruise=True),
+      params_memory=self.params_memory,
+      sm=self.sm,
+      is_metric=True,
+      _redneck_target_speed_ms=0.0,
+      _redneck_engaged_prev=False,
+    )
+
+  def test_cusw_rising_edge_locks_to_cluster_speed(self):
+    cs = SimpleNamespace(
+      cruiseState=SimpleNamespace(enabled=True, speedCluster=100.0 * CV.KPH_TO_MS),
+      vEgo=100.0 * CV.KPH_TO_MS,
+      buttonEvents=[],
+    )
+    cc = SimpleNamespace(enabled=True)
+
+    Car._update_redneck_cruise(self.card, cs, cc)
+
+    self.assertTrue(self.card._redneck_engaged_prev)
+    self.assertAlmostEqual(100.0 * CV.KPH_TO_MS, self.card._redneck_target_speed_ms)
+    self.redneck_cruise.run.assert_called_once_with(cs, cc, 100.0 * CV.KPH_TO_MS, True, lead_present=False)
+
+  def test_cusw_disengaged_resets_target_and_buttons(self):
+    self.card._redneck_engaged_prev = True
+    self.card._redneck_target_speed_ms = 100.0 * CV.KPH_TO_MS
+    cs = SimpleNamespace(
+      cruiseState=SimpleNamespace(enabled=False, speedCluster=0.0),
+      vEgo=0.0,
+      buttonEvents=[],
+    )
+    cc = SimpleNamespace(enabled=False)
+
+    Car._update_redneck_cruise(self.card, cs, cc)
+
+    self.assertFalse(self.card._redneck_engaged_prev)
+    self.assertEqual(0.0, self.card._redneck_target_speed_ms)
+    self.assertEqual(0, self.card.CI.CS.redneck_send_button)
+    self.assertEqual(0, self.card.CI.CS.redneck_v_target)
+    self.redneck_cruise.run.assert_not_called()
+
+  def test_cusw_resume_while_engaged_adopts_speed_limit_with_offset(self):
+    self.card._redneck_engaged_prev = True
+    self.card._redneck_target_speed_ms = 100.0 * CV.KPH_TO_MS
+
+    starpilot_plan = SimpleNamespace(
+      slcSpeedLimit=80.0 * CV.KPH_TO_MS,
+      slcSpeedLimitOffset=4.0 * CV.KPH_TO_MS,  # +5% offset
+    )
+    self.sm.seen["starpilotPlan"] = True
+    self.sm.valid["starpilotPlan"] = True
+    self.sm.__getitem__.side_effect = {"starpilotPlan": starpilot_plan}.__getitem__
+
+    cs = SimpleNamespace(
+      cruiseState=SimpleNamespace(enabled=True, speedCluster=100.0 * CV.KPH_TO_MS),
+      vEgo=100.0 * CV.KPH_TO_MS,
+      buttonEvents=[SimpleNamespace(type=ButtonType.resumeCruise, pressed=True)],
+    )
+    cc = SimpleNamespace(enabled=True)
+
+    Car._update_redneck_cruise(self.card, cs, cc)
+
+    expected_limit = 84.0 * CV.KPH_TO_MS
+    self.assertAlmostEqual(expected_limit, self.card._redneck_target_speed_ms)
+    self.params_memory.put_bool.assert_called_with("SLCAdoptSpeedLimit", True)
+    self.redneck_cruise.run.assert_called_once_with(cs, cc, expected_limit, True, lead_present=False)
+
+  def test_cusw_manual_buttons_update_target_speed(self):
+    self.card._redneck_engaged_prev = True
+    self.card._redneck_target_speed_ms = 105.0 * CV.KPH_TO_MS
+
+    cs = SimpleNamespace(
+      cruiseState=SimpleNamespace(enabled=True, speedCluster=80.0 * CV.KPH_TO_MS),
+      vEgo=80.0 * CV.KPH_TO_MS,
+      buttonEvents=[SimpleNamespace(type=ButtonType.decelCruise, pressed=True)],
+    )
+    cc = SimpleNamespace(enabled=True)
+
+    Car._update_redneck_cruise(self.card, cs, cc)
+
+    self.assertAlmostEqual(80.0 * CV.KPH_TO_MS, self.card._redneck_target_speed_ms)
+    self.redneck_cruise.run.assert_called_once_with(cs, cc, 80.0 * CV.KPH_TO_MS, True, lead_present=False)
+
+  def test_cusw_bluetooth_adopt_speed_limit(self):
+    self.card._redneck_engaged_prev = True
+    self.card._redneck_target_speed_ms = 100.0 * CV.KPH_TO_MS
+    self.params_memory.get_bool.side_effect = lambda k: k == "SLCAdoptSpeedLimit"
+
+    starpilot_plan = SimpleNamespace(
+      slcSpeedLimit=100.0 * CV.KPH_TO_MS,
+      slcSpeedLimitOffset=5.0 * CV.KPH_TO_MS,  # +5%
+    )
+    self.sm.seen["starpilotPlan"] = True
+    self.sm.valid["starpilotPlan"] = True
+    self.sm.__getitem__.side_effect = {"starpilotPlan": starpilot_plan}.__getitem__
+
+    cs = SimpleNamespace(
+      cruiseState=SimpleNamespace(enabled=True, speedCluster=100.0 * CV.KPH_TO_MS),
+      vEgo=100.0 * CV.KPH_TO_MS,
+      buttonEvents=[],
+    )
+    cc = SimpleNamespace(enabled=True)
+
+    Car._update_redneck_cruise(self.card, cs, cc)
+
+    expected_limit = 105.0 * CV.KPH_TO_MS
+    self.assertAlmostEqual(expected_limit, self.card._redneck_target_speed_ms)
+    self.redneck_cruise.run.assert_called_once_with(cs, cc, expected_limit, True, lead_present=False)
+
+
 if __name__ == "__main__":
   unittest.main()
