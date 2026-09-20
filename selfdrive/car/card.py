@@ -26,7 +26,9 @@ from openpilot.selfdrive.car.cruise import (
   VCruiseHelper, IMPERIAL_INCREMENT, V_CRUISE_MAX, V_CRUISE_MIN,
   is_speed_limit_confirmation_pending,
 )
-from openpilot.selfdrive.car.redneck_cruise import RedneckCruise, select_redneck_target_speed
+from openpilot.selfdrive.car.redneck_cruise import (
+  MANUAL_BUTTON_INACTIVE_TIMER, RedneckCruise, select_redneck_target_speed,
+)
 from openpilot.selfdrive.car.car_specific import MockCarState
 
 from openpilot.starpilot.common.favorite_slots import (
@@ -204,6 +206,8 @@ class Car:
     self.mock_carstate = MockCarState()
     self.v_cruise_helper = VCruiseHelper(self.CP, self.FPCP)
     self.redneck_cruise = RedneckCruise(self.CP, self.FPCP) if self.CP.brand in ("hyundai", "chrysler") and getattr(self.FPCP, "redneckCruiseAvailable", False) else None
+    self._redneck_target_speed_ms = 0.0
+    self._redneck_engaged_prev = False
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.safe_mode = self.params.get_bool("SafeMode")
@@ -477,6 +481,52 @@ class Car:
     if self.redneck_cruise is None or not getattr(self.starpilot_toggles, "redneck_cruise", False):
       self.CI.CS.redneck_send_button = 0
       self.CI.CS.redneck_v_target = 0
+      return
+
+    if self.CP.carFingerprint in ("JEEP_CHEROKEE_5TH_GEN",):
+      is_engaged = CC.enabled and CS.cruiseState.enabled
+      if not is_engaged:
+        self._redneck_engaged_prev = False
+        self._redneck_target_speed_ms = 0.0
+        self.CI.CS.redneck_send_button = 0
+        self.CI.CS.redneck_v_target = 0
+        return
+
+      # On rising edge of engagement, lock target to current cluster set speed or vEgo
+      if not self._redneck_engaged_prev:
+        self._redneck_engaged_prev = True
+        self._redneck_target_speed_ms = float(CS.cruiseState.speedCluster) if CS.cruiseState.speedCluster > 0 else float(CS.vEgo)
+
+      # Check for manual speed adjustment buttons (SET-, SET+, ACC_Accel, ACC_Decel)
+      manual_buttons = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.setCruise)
+      manual_pressed = any(be.type in manual_buttons and be.pressed for be in CS.buttonEvents)
+      manual_active = manual_pressed or any(
+        0 < self.redneck_cruise.cruise_button_timers.get(int(k), 0) <= int(MANUAL_BUTTON_INACTIVE_TIMER / DT_CTRL)
+        for k in manual_buttons
+      )
+      if manual_active and CS.cruiseState.speedCluster > 0:
+        self._redneck_target_speed_ms = float(CS.cruiseState.speedCluster)
+
+      # Check for on-demand Adopt Speed Limit trigger:
+      # - RESUME button pressed while already engaged
+      # - Or SLCAdoptSpeedLimit flag set in memory params (e.g. from Bluetooth wheel controls or UI)
+      resume_pressed = any(be.type == ButtonType.resumeCruise and be.pressed for be in CS.buttonEvents)
+      adopt_requested = self.params_memory.get_bool("SLCAdoptSpeedLimit")
+      if resume_pressed or adopt_requested:
+        if self.sm.seen['starpilotPlan'] and self.sm.valid['starpilotPlan']:
+          starpilot_plan = self.sm['starpilotPlan']
+          slc_limit = float(starpilot_plan.slcSpeedLimit) + float(starpilot_plan.slcSpeedLimitOffset)
+          if slc_limit > 0.0:
+            self._redneck_target_speed_ms = slc_limit
+            self.params_memory.put_bool("SLCAdoptSpeedLimit", True)
+
+      if self._redneck_target_speed_ms <= 0.0 and CS.cruiseState.speedCluster > 0:
+        self._redneck_target_speed_ms = float(CS.cruiseState.speedCluster)
+
+      v_target_ms = self._redneck_target_speed_ms if self._redneck_target_speed_ms > 0 else float(CS.cruiseState.speedCluster)
+      send_button, v_target = self.redneck_cruise.run(CS, CC, v_target_ms, self.is_metric, lead_present=False)
+      self.CI.CS.redneck_send_button = send_button
+      self.CI.CS.redneck_v_target = v_target
       return
 
     v_target_ms, lead_present = self._get_redneck_target_speed(CS, CC)
