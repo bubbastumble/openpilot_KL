@@ -37,6 +37,7 @@ CONTROLLER_ACTION_BOOKMARK = "__starpilot_controller_action__:bookmark"
 CONTROLLER_ACTION_PULSE_AND_GLIDE = "__starpilot_controller_action__:pulse_and_glide"
 CONTROLLER_ACTION_FORCE_COAST = "__starpilot_controller_action__:force_coast"
 CONTROLLER_ACTION_TOGGLE_AOL = "__starpilot_controller_action__:toggle_aol"
+CONTROLLER_ACTION_ADOPT_SPEED_LIMIT = "__starpilot_controller_action__:adopt_speed_limit"
 CONTROLLER_ACTION_COUNTERS = {
   CONTROLLER_ACTION_BOOKMARK: "WheelButtonBookmarkCounter",
   CONTROLLER_ACTION_PULSE_AND_GLIDE: "WheelControlPulseGlideCounter",
@@ -80,6 +81,12 @@ CONTROLLER_ACTION_OPTIONS = (
     "key": CONTROLLER_ACTION_TOGGLE_AOL,
     "label": "Toggle AOL",
     "description": "Toggles Always On Lateral like the vehicle LKAS button; it does not change the AOL setting.",
+    "section": "Controller Actions",
+  },
+  {
+    "key": CONTROLLER_ACTION_ADOPT_SPEED_LIMIT,
+    "label": "Adopt Speed Limit",
+    "description": "Adopts the active speed limit with offset into the cruise set speed.",
     "section": "Controller Actions",
   },
 )
@@ -485,6 +492,9 @@ def execute_controller_action(index: int, params: Params, params_memory: Params)
     return set_controller_cruise_speed(slot.get("value"), params, params_memory)
   if slot.get("key") == CONTROLLER_ACTION_SELFIE:
     return request_comma_selfie()
+  if slot.get("key") == CONTROLLER_ACTION_ADOPT_SPEED_LIMIT:
+    params_memory.put_bool("SLCAdoptSpeedLimit", True)
+    return True
   if slot.get("key") in CONTROLLER_ACTION_COUNTERS:
     return trigger_controller_action(slot["key"], params_memory)
   return execute_favorite_key(slot.get("key"), params, params_memory)
