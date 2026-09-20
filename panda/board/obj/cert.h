@@ -1,5 +1,3 @@
-#pragma once
-
 RSAPublicKey debug_rsa_key = {
   .len = 0x20,
   .n0inv = 424155863U,
