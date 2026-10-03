@@ -47,6 +47,7 @@ from openpilot.starpilot.galaxy.web_assets import WebAssets
 from openpilot.starpilot.galaxy.software_operations import SoftwareOperations, SoftwareOperationError
 from openpilot.starpilot.galaxy.settings import PAGES, SettingsGateway, SettingsChanged, SettingsUnavailable
 from openpilot.starpilot.galaxy.onroad_layout import LayoutChanged, OnroadLayoutOwner
+from openpilot.starpilot.galaxy import telemetry
 from openpilot.starpilot.ui.layout_preview_transport import (request_profile)
 from openpilot.starpilot.favorites.owner import FavoritesChanged
 from openpilot.starpilot.galaxy.favorites import FavoritesGateway
@@ -1568,6 +1569,18 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             self.json(200, result)
           else:
             self.json(401, {'error': 'Sign in to Galaxy'})
+      elif path == '/api/car/telemetry':
+        try:
+          self.json(200, telemetry.get_telemetry_data())
+        except (OSError, RuntimeError, ValueError) as error:
+          self.json(503, {'error': f'Telemetry unavailable: {error}'})
+        return
+      elif path == '/api/car/diagnostics':
+        try:
+          self.json(200, telemetry.get_telemetry_data().get('diagnostics', {}))
+        except (OSError, RuntimeError, ValueError) as error:
+          self.json(503, {'error': f'Diagnostics unavailable: {error}'})
+        return
       elif path.startswith('/api/'):
         if self.require_session():
           self.json(404, {'error': 'Capability unavailable'})
@@ -2938,6 +2951,12 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             self.json(200, result)
           else:
             self.json(401, {'error': 'Sign in to Galaxy'})
+        return
+      if path == '/api/car/diagnostics/scan':
+        try:
+          self.json(200, telemetry.scan_diagnostics())
+        except (OSError, RuntimeError, ValueError) as error:
+          self.json(503, {'error': f'Diagnostics scan failed: {error}'})
         return
       if not isinstance(payload, dict) or set(payload) != {'password'} or \
          not isinstance(payload['password'], str) or not 6 <= len(payload['password']) <= 255:
