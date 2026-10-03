@@ -115,7 +115,7 @@ from openpilot.starpilot.common.testing_grounds import (
 )
 from openpilot.starpilot.navigation.destination_store import normalize_destination_payload, update_recent_destinations
 from openpilot.starpilot.system.the_galaxy.factory_reset import remove_path as _run_factory_reset_delete
-from openpilot.starpilot.system.the_galaxy import flm_workspace, utilities
+from openpilot.starpilot.system.the_galaxy import flm_workspace, utilities, telemetry
 from openpilot.starpilot.system.the_galaxy.update_recovery import inspect_interrupted_update, public_recovery_status, recover_interrupted_update
 from openpilot.starpilot.system.bluetooth import BluetoothClient
 from openpilot.starpilot.system.wheel_controls import (
@@ -7359,6 +7359,18 @@ def setup(app):
       "lanIp": utilities.get_current_lan_ip(),
       "networkName": utilities.get_current_network_name(),
     }), 200
+
+  @app.route("/api/car/telemetry", methods=["GET"])
+  def car_telemetry():
+    return jsonify(telemetry.get_telemetry_data()), 200
+
+  @app.route("/api/car/diagnostics", methods=["GET"])
+  def car_diagnostics():
+    return jsonify(telemetry.get_telemetry_data().get("diagnostics", {})), 200
+
+  @app.route("/api/car/diagnostics/scan", methods=["POST"])
+  def car_diagnostics_scan():
+    return jsonify(telemetry.scan_diagnostics()), 200
 
   @app.route("/api/stats/ignore_drive", methods=["POST"])
   def ignore_drive_stats():
