@@ -31,12 +31,16 @@ _telemetry_state: Dict[str, Any] = {
   },
   "vehicle": {
     "speedMph": 0.0,
+    "speedKmh": 0.0,
     "gear": "P",
     "batteryVoltage": 12.3,
     "batteryState": "RESTING",   # "RESTING", "CHARGING", "LOW"
-    "fuelLevelPercent": 75.0,
+    "fuelLevelPercent": 30.0,
     "fuelLow": False,
-    "estimatedRangeMiles": 260,
+    "estimatedRangeMiles": 105,
+    "estimatedRangeKm": 169,
+    "odometerMiles": 76454,
+    "odometerKm": 123041,
   },
   "tpms": {
     "flPsi": 35.0,
@@ -77,27 +81,41 @@ def _load_persisted_state():
     if os.path.exists(_LAST_KNOWN_FILE):
       with open(_LAST_KNOWN_FILE, "r") as f:
         data = json.load(f)
-        if "vehicle" in data and "fuelLevelPercent" in data["vehicle"]:
-          _telemetry_state["vehicle"]["fuelLevelPercent"] = data["vehicle"]["fuelLevelPercent"]
-          _telemetry_state["vehicle"]["estimatedRangeMiles"] = data["vehicle"].get("estimatedRangeMiles", 260)
-        if "tpms" in data:
-          _telemetry_state["tpms"].update(data["tpms"])
-        if "diagnostics" in data:
-          _telemetry_state["diagnostics"].update(data["diagnostics"])
+        with _TELEMETRY_LOCK:
+          if "vehicle" in data:
+            v = data["vehicle"]
+            if "fuelLevelPercent" in v:
+              _telemetry_state["vehicle"]["fuelLevelPercent"] = v["fuelLevelPercent"]
+              _telemetry_state["vehicle"]["fuelLow"] = v.get("fuelLow", v["fuelLevelPercent"] < 15.0)
+              est_mi = v.get("estimatedRangeMiles", int(round(350.0 * (v["fuelLevelPercent"] / 100.0))))
+              _telemetry_state["vehicle"]["estimatedRangeMiles"] = est_mi
+              _telemetry_state["vehicle"]["estimatedRangeKm"] = v.get("estimatedRangeKm", int(round(est_mi * 1.60934)))
+              odo_mi = v.get("odometerMiles", 76454)
+              _telemetry_state["vehicle"]["odometerMiles"] = odo_mi
+              _telemetry_state["vehicle"]["odometerKm"] = v.get("odometerKm", int(round(odo_mi * 1.60934)))
+          if "tpms" in data:
+            _telemetry_state["tpms"].update(data["tpms"])
+          if "diagnostics" in data:
+            _telemetry_state["diagnostics"].update(data["diagnostics"])
   except Exception:
     pass
 
 def _save_persisted_state():
   try:
+    with _TELEMETRY_LOCK:
+      payload = {
+        "vehicle": {
+          "fuelLevelPercent": _telemetry_state["vehicle"]["fuelLevelPercent"],
+          "fuelLow": _telemetry_state["vehicle"]["fuelLow"],
+          "estimatedRangeMiles": _telemetry_state["vehicle"]["estimatedRangeMiles"],
+          "estimatedRangeKm": _telemetry_state["vehicle"]["estimatedRangeKm"],
+          "odometerMiles": _telemetry_state["vehicle"].get("odometerMiles", 76454),
+          "odometerKm": _telemetry_state["vehicle"].get("odometerKm", 123041),
+        },
+        "tpms": _telemetry_state["tpms"],
+        "diagnostics": _telemetry_state["diagnostics"],
+      }
     os.makedirs(os.path.dirname(_LAST_KNOWN_FILE), exist_ok=True)
-    payload = {
-      "vehicle": {
-        "fuelLevelPercent": _telemetry_state["vehicle"]["fuelLevelPercent"],
-        "estimatedRangeMiles": _telemetry_state["vehicle"]["estimatedRangeMiles"],
-      },
-      "tpms": _telemetry_state["tpms"],
-      "diagnostics": _telemetry_state["diagnostics"],
-    }
     with open(_LAST_KNOWN_FILE, "w") as f:
       json.dump(payload, f)
   except Exception:
@@ -120,6 +138,23 @@ def _telemetry_worker():
   except Exception:
     pass
 
+  voltage_v = 12.3
+  ignition = False
+  battery_state = "RESTING"
+  device_battery = 100
+  cpu_temp = 0.0
+  rpm = 0
+  last_rpm_time = 0.0
+  speed_mph = 0.0
+  speed_kmh = 0.0
+  gear = "P"
+  door_fl = False
+  door_fr = False
+  door_rl = False
+  door_rr = False
+  trunk = False
+  driver_unlatched = False
+
   while True:
     with _TELEMETRY_LOCK:
       idle_time = time.monotonic() - _telemetry_last_client_ts
@@ -131,9 +166,7 @@ def _telemetry_worker():
       sm.update(0)
 
       # 1. Update from Panda state (12V battery & ignition)
-      voltage_v = 12.3
-      ignition = False
-      if sm.updated["pandaStates"] and len(sm["pandaStates"]) > 0:
+      if len(sm["pandaStates"]) > 0:
         ps = sm["pandaStates"][0]
         voltage_v = round(ps.voltage / 1000.0, 2)
         ignition = bool(ps.ignitionLine or ps.ignitionCan)
@@ -147,43 +180,40 @@ def _telemetry_worker():
         battery_state = "RESTING"
 
       # 2. Update from device state
-      device_battery = 100
-      cpu_temp = 0.0
       if sm.valid["deviceState"]:
         ds = sm["deviceState"]
         device_battery = int(ds.batteryPercent)
         cpu_temp = round(float(ds.cpuTempC), 1)
 
       # 3. Parse live CAN frames if available
-      rpm = 0
-      speed_mph = 0.0
-      gear = "P"
-      door_fl = False
-      door_fr = False
-      door_rl = False
-      door_rr = False
-      trunk = False
-      driver_unlatched = False
+      fuel_pct = None
+      fuel_low = None
+      est_range_mi = None
+      est_range_km = None
+      odometer_miles = None
+      odometer_km = None
 
       if can_sock:
         can_msgs = messaging.drain_sock(can_sock)
         for msg in can_msgs:
           for c in msg.can:
             # CLUSTER_1 (0x1F0): RPM & Speed
-            if c.address == 0x1F0 and c.src == 0:
+            if c.address == 0x1F0 and c.src == 0 and len(c.dat) >= 4:
               raw_val = ((c.dat[0] & 0x0F) << 8) | c.dat[1]
               rpm = int(raw_val * 1.024)
+              last_rpm_time = time.time()
               raw_speed = ((c.dat[2] & 0x0F) << 8) | c.dat[3]
               speed_mph = round((raw_speed * 0.01065) * 2.23694, 1)
+              speed_kmh = round((raw_speed * 0.01065) * 3.6, 1)
 
             # GEAR (0x4EE): PRNDL
-            elif c.address == 0x4EE and c.src == 0:
-              prndl_val = (c.dat[1] >> 4) & 0x0F
+            elif c.address == 0x4EE and c.src == 0 and len(c.dat) >= 2:
+              prndl_val = c.dat[1] & 0x0F
               gear_map = {1: "P", 2: "R", 3: "N", 4: "D", 5: "S"}
               gear = gear_map.get(prndl_val, "P")
 
             # DOORS (0x4E2): Door & Liftgate open flags
-            elif c.address == 0x4E2 and c.src == 0:
+            elif c.address == 0x4E2 and c.src == 0 and len(c.dat) >= 2:
               door_fl = bool((c.dat[1] >> 2) & 1)
               door_fr = bool((c.dat[1] >> 3) & 1)
               door_rl = bool((c.dat[1] >> 4) & 1)
@@ -191,21 +221,56 @@ def _telemetry_worker():
               trunk = bool((c.dat[1] >> 6) & 1)
 
             # SEATBELT_STATUS (0x36B)
-            elif c.address == 0x36B and c.src == 0:
+            elif c.address == 0x36B and c.src == 0 and len(c.dat) >= 3:
               driver_unlatched = bool(c.dat[2] & 1)
 
-      # If CAN is quiet but openpilot carState is running:
+            # FUEL_AND_ODOMETER (0x65A): Fuel Level % and Mileage
+            elif c.address == 0x65A and c.src == 0 and len(c.dat) >= 8:
+              raw_pct = float(c.dat[0]) + ((c.dat[1] >> 6) * 0.25)
+              if 0.0 <= raw_pct <= 100.0:
+                fuel_pct = round(raw_pct, 1)
+                fuel_low = fuel_pct < 15.0
+                est_range_mi = int(round(350.0 * (fuel_pct / 100.0)))
+                est_range_km = int(round(est_range_mi * 1.60934))
+              km = (c.dat[2] << 16) | (c.dat[3] << 8) | c.dat[4]
+              mi = (c.dat[5] << 16) | (c.dat[6] << 8) | c.dat[7]
+              if km > 0:
+                odometer_km = km
+              if mi > 0:
+                odometer_miles = mi
+
+      # Decay RPM if no fresh frames for > 2.5 seconds
+      if time.time() - last_rpm_time > 2.5:
+        rpm = 0
+
+      # If openpilot carState is running:
       if sm.valid["carState"]:
         cs = sm["carState"]
-        if speed_mph == 0.0 and cs.vEgo > 0.01:
+        if cs.vEgo > 0.01:
           speed_mph = round(cs.vEgo * 2.23694, 1)
-        if cs.gearShifter != "unknown":
-          gear = str(cs.gearShifter).upper()
+          speed_kmh = round(cs.vEgo * 3.6, 1)
+        elif time.time() - last_rpm_time > 2.5:
+          speed_mph = 0.0
+          speed_kmh = 0.0
+
+        shifter_str = str(cs.gearShifter).lower()
+        if shifter_str in ("park", "p"):
+          gear = "P"
+        elif shifter_str in ("drive", "d"):
+          gear = "D"
+        elif shifter_str in ("reverse", "r"):
+          gear = "R"
+        elif shifter_str in ("neutral", "n"):
+          gear = "N"
+        elif shifter_str in ("sport", "s"):
+          gear = "S"
+
         door_fl = door_fl or cs.doorOpen
-        driver_unlatched = driver_unlatched or cs.seatbeltUnlatched
+        driver_unlatched = cs.seatbeltUnlatched
 
       # 4. Engine & Remote Start State Machine
-      engine_running = (rpm > 400) or (voltage_v >= 13.5 and ignition)
+      # Engine is running if tachometer RPM > 400 or alternator active (>= 13.4V) with ignition
+      engine_running = (rpm > 400) or (voltage_v >= 13.4 and ignition)
       if engine_running:
         if not _was_engine_running:
           _idle_start_timestamp = time.time()
@@ -237,10 +302,21 @@ def _telemetry_worker():
         })
         _telemetry_state["vehicle"].update({
           "speedMph": speed_mph,
+          "speedKmh": speed_kmh,
           "gear": gear,
           "batteryVoltage": voltage_v,
           "batteryState": battery_state,
         })
+        if fuel_pct is not None:
+          _telemetry_state["vehicle"]["fuelLevelPercent"] = fuel_pct
+          _telemetry_state["vehicle"]["fuelLow"] = fuel_low
+          _telemetry_state["vehicle"]["estimatedRangeMiles"] = est_range_mi
+          _telemetry_state["vehicle"]["estimatedRangeKm"] = est_range_km
+          if odometer_miles is not None:
+            _telemetry_state["vehicle"]["odometerMiles"] = odometer_miles
+          if odometer_km is not None:
+            _telemetry_state["vehicle"]["odometerKm"] = odometer_km
+          _save_persisted_state()
         _telemetry_state["doors"].update({
           "anyOpen": (door_fl or door_fr or door_rl or door_rr or trunk),
           "frontLeft": door_fl,
@@ -275,6 +351,7 @@ def _ensure_telemetry_worker():
 
 def get_telemetry_data() -> Dict[str, Any]:
   _ensure_telemetry_worker()
+  _load_persisted_state()
   with _TELEMETRY_LOCK:
     res = dict(_telemetry_state)
     res["engine"] = dict(_telemetry_state["engine"])
