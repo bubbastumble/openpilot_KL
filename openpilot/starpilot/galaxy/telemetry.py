@@ -9,7 +9,7 @@ from cereal import messaging
 from openpilot.common.params import Params
 from openpilot.starpilot.system.the_galaxy import utilities
 
-_TELEMETRY_LOCK = threading.Lock()
+_TELEMETRY_LOCK = threading.RLock()
 _telemetry_worker_thread = None
 _telemetry_last_client_ts = 0.0
 _TELEMETRY_CLIENT_IDLE_TIMEOUT_S = 600.0  # Keep polling for 10 mins after last request
@@ -182,8 +182,16 @@ def _telemetry_worker():
       # 2. Update from device state
       if sm.valid["deviceState"]:
         ds = sm["deviceState"]
-        device_battery = int(ds.batteryPercent)
-        cpu_temp = round(float(ds.cpuTempC), 1)
+        try:
+          device_battery = int(getattr(ds, "batteryPercent", getattr(ds, "batteryPercentDEPRECATED", 100)))
+          if hasattr(ds, "maxTempC"):
+            cpu_temp = round(float(ds.maxTempC), 1)
+          elif hasattr(ds, "cpuTempC") and ds.cpuTempC:
+            cpu_temp = round(float(max(ds.cpuTempC)), 1)
+          else:
+            cpu_temp = 0.0
+        except Exception:
+          pass
 
       # 3. Parse live CAN frames if available
       fuel_pct = None
