@@ -18,8 +18,8 @@ class CarInterface(CarInterfaceBase):
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "chrysler"
 
-    # TODO: Chrysler CUSW in dashcam pending comma safety validation and a fix for LKAS fault on disengage
-    ret.dashcamOnly = candidate in (RAM_HD | CUSW_CARS)
+    # CUSW platforms (Jeep Cherokee Trailhawk) enabled for openpilot control
+    ret.dashcamOnly = candidate in RAM_HD
 
     # radar parsing needs some work, see https://github.com/commaai/openpilot/issues/26842
     ret.radarUnavailable = True # Bus.radar not in DBC[candidate][Bus.radar]
