@@ -1,13 +1,33 @@
 #!/usr/bin/env python3
 import json
 import os
+import socket
+import subprocess
 import threading
 import time
 from typing import Any, Dict
 
 from cereal import messaging
 from openpilot.common.params import Params
-from openpilot.starpilot.galaxy import utilities
+
+
+def _get_current_lan_ip() -> str:
+  try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+      s.connect(("8.8.8.8", 80))
+      return s.getsockname()[0]
+  except Exception:
+    return ""
+
+
+def _get_current_network_name() -> str:
+  try:
+    res = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, timeout=1)
+    if res.returncode == 0 and res.stdout.strip():
+      return res.stdout.strip()
+  except Exception:
+    pass
+  return ""
 
 _TELEMETRY_LOCK = threading.RLock()
 _telemetry_worker_thread = None
@@ -370,8 +390,8 @@ def get_telemetry_data() -> Dict[str, Any]:
     res["seatbelt"] = dict(_telemetry_state["seatbelt"])
     res["device"] = dict(_telemetry_state["device"])
 
-  res["device"]["lanIp"] = utilities.get_current_lan_ip()
-  res["device"]["networkName"] = utilities.get_current_network_name()
+  res["device"]["lanIp"] = _get_current_lan_ip()
+  res["device"]["networkName"] = _get_current_network_name()
   return res
 
 def scan_diagnostics() -> Dict[str, Any]:
