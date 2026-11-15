@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from cereal import messaging
 from openpilot.common.params import Params
-from openpilot.starpilot.system.the_galaxy import utilities
+from openpilot.starpilot.galaxy import utilities
 
 _TELEMETRY_LOCK = threading.RLock()
 _telemetry_worker_thread = None
